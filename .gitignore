@@ -1,0 +1,41 @@
+# runtime / generated
+__pycache__/
+*.pyc
+*.pyo
+.workdir/
+workdir/
+inbox/
+logs/
+library/
+covers/
+sources/
+*.db
+*.db-wal
+*.db-shm
+*.bak
+*.bak2
+*.bak3
+
+# local runtime config (template: kit/config.json.template)
+pipeline/config.json
+pipeline/conf/auto_opencode.json
+
+# contains a live AIBOOK_TOKEN — template: kit/opencode.json.example
+opencode.json
+
+# build artifact (regenerate: python kit/build_kit.py)
+web/static/aibook-kit.zip
+kit/dist/
+
+# secrets
+deploy_secrets.json
+*.pem
+*.key
+
+# client-only deps
+.opencode/node_modules/
+node_modules/
+
+# os
+.DS_Store
+Thumbs.db

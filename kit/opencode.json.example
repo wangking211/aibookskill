@@ -1,0 +1,26 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "book-library": {
+      "type": "local",
+      "command": ["{{PYTHON}}", "{{ROOT}}/skill-server/server.py"],
+      "enabled": true,
+      "environment": {
+        "SKILLS_HOME": "{{SKILLS_HOME}}",
+        "REGISTRY_DB": "{{ROOT}}/pipeline/registry.db",
+        "PYTHONUTF8": "1"
+      }
+    },
+    "aibook": {
+      "type": "local",
+      "command": ["{{PYTHON}}", "{{ROOT}}/mcp_server.py"],
+      "enabled": true,
+      "timeout": 620000,
+      "environment": {
+        "AIBOOK_BASE_URL": "{{BASE_URL}}",
+        "AIBOOK_TOKEN": "{{AIBOOK_TOKEN}}",
+        "PYTHONUTF8": "1"
+      }
+    }
+  }
+}

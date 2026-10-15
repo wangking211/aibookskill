@@ -1,0 +1,14 @@
+你正在进行一次无人值守的书籍转换任务。硬性规则:
+- 全程禁止向用户提问或等待确认;如 book-to-skill 规范要求选择参数,一律使用下方给定值
+- 只允许在给定的 $workdir 与 $skill_dir 路径内读写,不触碰其他路径
+- 输入PDF已隔离为单一文件: $pdf_path
+- skill-name-slug: $slug
+- BOOK_TYPE: $book_type
+- DEPTH: $depth
+- 语言规则: $language_rule
+- 产物目录(直接写入此目录): $skill_dir
+- 必须完成 book-to-skill 完整流程(含 Step 9.5 质检)
+- 结束前必须执行并确认 EXIT=0: python "$scan_tool" "$skill_dir"
+- 全部完成后,最后输出一行以 RESULT_JSON 开头的单行合法JSON(不要放在代码块里):
+  RESULT_JSON {"slug":"$slug","status":"ok","title":"书名","author":"作者","publisher":"出版社","intro":"150字以内中文书籍介绍","chapters":0}
+  任何失败则输出: RESULT_JSON {"slug":"$slug","status":"error","error":"失败原因"}

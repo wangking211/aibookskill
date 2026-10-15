@@ -1,0 +1,45 @@
+{
+  "model": "{{MODEL}}",
+  "model_chain": [
+    "{{MODEL}}",
+    "opencode-go/mimo-v2.6-flash"
+  ],
+  "translate_chain": [
+    "{{MODEL}}",
+    "deepseek/deepseek-chat"
+  ],
+  "opencode_bin": "{{OPENCODE_BIN}}",
+  "opencode_serve_url": "http://127.0.0.1:4096",
+  "api_key": "",
+  "api_key_env": "",
+  "answer_model": "{{MODEL}}",
+  "answer_chain": [
+    "{{MODEL}}"
+  ],
+  "answer_base_url": "",
+  "answer_max_tokens": 4000,
+  "deep_max_tokens": 3000,
+  "reasoning_fallback": false,
+  "model_timeouts": {
+    "deepseek/deepseek-chat": 25,
+    "xiaopuyun/deepseek-v4-flash": 40,
+    "opencode/mimo-v2.6-flash-free": 20
+  },
+  "timeout_min": 90,
+  "max_retries": 2,
+  "book_type": "text",
+  "depth": "study",
+  "skills_home": "{{SKILLS_HOME}}",
+  "scan_tool": "{{SCAN_TOOL}}",
+  "inbox": "inbox",
+  "workdir": "workdir",
+  "logs": "logs",
+  "covers": "covers",
+  "library": "library",
+  "registry_db": "pipeline/registry.db",
+  "cos_bucket": "",
+  "cos_region": "",
+  "cos_secret_id": "",
+  "cos_secret_key": "",
+  "cos_prefix": "uploads/"
+}

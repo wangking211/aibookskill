@@ -1,0 +1,11 @@
+mcp>=2
+pymupdf>=1.26
+httpx>=0.27
+
+# book-to-skill 文档提取（缺失时对应格式会降级或跳过）
+pypdf
+pdfminer.six
+beautifulsoup4
+ebooklib
+python-docx
+striprtf

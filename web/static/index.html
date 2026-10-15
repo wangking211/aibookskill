@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>书库</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">书库 <span class="sub">Book Skill Library</span></div>
+  <nav id="nav">
+    <button data-tab="library" class="on">书库</button>
+    <button data-tab="upload">上传</button>
+    <button data-tab="jobs">任务</button>
+    <button data-tab="faq">常见问题</button>
+  </nav>
+  <div id="auth-anon" class="auth">
+    <button id="btn-login">登录</button>
+    <button id="btn-register" class="primary">注册</button>
+  </div>
+  <div id="auth-user" class="auth" hidden>
+    <span id="auth-name"></span>
+    <button id="btn-tokens">令牌</button>
+    <button id="btn-logout">退出</button>
+  </div>
+</header>
+
+<main>
+  <section id="tab-library" class="tab on">
+    <div class="bar">
+      <input id="q" type="search" placeholder="搜索书名 / 作者 / 简介…" autocomplete="off">
+      <button id="btn-search" class="primary">搜索</button>
+    </div>
+    <div id="books" class="grid"></div>
+    <p id="books-empty" class="empty" hidden>没有匹配的书</p>
+  </section>
+
+  <section id="tab-upload" class="tab">
+    <div class="card panel">
+      <h2>上传书籍（转换后进入公共书库）</h2>
+      <div id="drop" class="drop">拖拽 PDF 到此处，或 <label for="file">选择文件</label>
+        <input id="file" type="file" accept="application/pdf" hidden>
+      </div>
+      <form id="up-form">
+        <div class="row">
+          <label>slug（可空，自动生成）
+            <input id="up-slug" placeholder="english-framework">
+          </label>
+          <label>类型
+            <select id="up-type"><option value="">默认</option><option>text</option><option>technical</option></select>
+          </label>
+          <label>深度
+            <select id="up-depth"><option value="">默认</option><option>study</option><option>reference</option></select>
+          </label>
+          <label>模型
+            <select id="up-model">
+              <option value="">自动（免费优先）</option>
+              <option value="xiaopuyun/deepseek-v4-flash">小铺云 flash（付费·快）</option>
+              <option value="xiaopuyun/deepseek-v4-pro">小铺云 pro（付费·强）</option>
+              <option value="deepseek/deepseek-v4-pro">DeepSeek 原生 pro</option>
+            </select>
+          </label>
+          <label>语言
+            <select id="up-lang">
+              <option value="">原文</option>
+              <option value="zh">翻译成中文</option>
+              <option value="bi">中英对照（左原右译）</option>
+            </select>
+          </label>
+        </div>
+        <button class="primary" id="up-go">上传并开始转换</button>
+      </form>
+      <p id="up-name" class="hint"></p>
+    </div>
+  </section>
+
+  <section id="tab-jobs" class="tab">
+    <div class="bar">
+      <h2>处理任务</h2>
+      <button id="btn-jobs-refresh">刷新</button>
+    </div>
+    <div class="table-wrap">
+      <table id="jobs">
+        <thead><tr>
+          <th>时间</th><th>任务</th><th>书</th><th>状态</th><th>用时</th><th>Tokens</th><th>模型</th><th>进度</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <pre id="job-log" class="log" hidden></pre>
+  </section>
+
+  <section id="tab-faq" class="tab">
+    <div class="bar">
+      <h2>常见问题</h2>
+      <select id="faq-scope"><option value="">全部书籍</option></select>
+    </div>
+    <p class="hint">提问会被自动记录，出现频次高的问题会汇总到这里；未回答的问题可生成或手动补充答案。</p>
+    <div class="ask">
+      <input id="lib-question" placeholder="向整个书库提问，例如：这几本书对“习惯养成”怎么说？" autocomplete="off">
+      <label class="deep-toggle" title="检索更多书与片段，耗时更长">
+        <input type="checkbox" id="lib-deep"> 深度
+      </label>
+      <button id="lib-ask" class="primary">问书库</button>
+    </div>
+    <div id="lib-result"></div>
+    <p class="hint">客户端安装包（aibook MCP + book-to-skill + 本地转换栈 + Windows/macOS 安装脚本）：
+      <a href="/static/aibook-kit.zip" download>下载 aibook-kit.zip</a>，
+      解压后运行 <code>install.ps1</code> 或 <code>bash install.sh</code>。</p>
+    <div id="faq-list" class="list"></div>
+  </section>
+</main>
+
+<div id="auth-modal" class="overlay modal" hidden>
+  <div class="modal-card">
+    <h2 id="auth-title">登录</h2>
+    <label>邮箱或手机号<input id="au-identifier" autocomplete="username"></label>
+    <label>密码<input id="au-password" type="password" autocomplete="current-password"></label>
+    <label id="au-name-row" hidden>昵称（可空）<input id="au-display"></label>
+    <p id="auth-err" class="err"></p>
+    <div class="actions">
+      <button id="au-submit" class="primary">登录</button>
+      <button id="au-switch" class="ghost">没有账号？去注册</button>
+      <button id="au-cancel" class="ghost">取消</button>
+    </div>
+  </div>
+</div>
+
+<div id="token-modal" class="overlay modal" hidden>
+  <div class="modal-card">
+    <h2>API 令牌</h2>
+    <p class="hint">供 opencode / Claude 等 agent 通过 API 或 MCP 访问书库。令牌仅在创建时完整显示一次，之后只显示掩码。</p>
+    <div class="tk-new">
+      <input id="tk-name" placeholder="备注名（如 laptop / ci-agent）">
+      <button id="tk-create" class="primary">创建令牌</button>
+    </div>
+    <div id="tk-just" class="tk-just" hidden>
+      <p class="hint">新令牌（请立即复制保存）：</p>
+      <code id="tk-full"></code>
+      <button id="tk-copy" class="ghost">复制</button>
+      <p class="hint">opencode MCP 配置（填入上面令牌）：</p>
+      <pre id="tk-mcp"></pre>
+      <p class="hint">或直接下载安装包 <a href="/static/aibook-kit.zip" download>aibook-kit.zip</a>
+        （含 MCP 客户端 + book-to-skill + 本地转换栈 + 安装脚本），解压后
+        <code>python setup.py --token 你的令牌</code>。</p>
+    </div>
+    <ul id="tk-list" class="tk-list"></ul>
+    <div class="actions">
+      <button id="tk-close" class="ghost">关闭</button>
+    </div>
+  </div>
+</div>
+
+<div id="detail" class="overlay" hidden>
+  <div class="sheet">
+    <button id="d-close" class="ghost">← 返回</button>
+    <div class="d-head">
+      <img id="d-cover" alt="" hidden>
+      <div>
+        <h2 id="d-title"></h2>
+        <p id="d-meta" class="muted"></p>
+        <div id="d-badges" class="badges"></div>
+        <div class="actions">
+          <a id="d-src" class="btn" hidden>下载源文件</a>
+          <a id="d-skill" class="btn" hidden>下载 SKILL</a>
+          <select id="d-reproc-lang" title="重新处理时的语言">
+            <option value="">原文</option>
+            <option value="zh">翻译成中文</option>
+            <option value="bi">中英对照</option>
+          </select>
+          <button id="d-process" class="primary">重新处理</button>
+          <button id="d-visibility" hidden></button>
+        </div>
+      </div>
+    </div>
+    <p id="d-intro"></p>
+    <div class="ask">
+      <input id="d-question" placeholder="对这本书提问，记录你的问题以形成常见问题…">
+      <label class="deep-toggle" title="多步检索并阅读章节，回答更深入，耗时更长">
+        <input type="checkbox" id="d-deep"> 深度模式
+      </label>
+      <button id="d-ask" class="primary">提问</button>
+    </div>
+    <div id="d-hits"></div>
+    <div class="qa-cols">
+      <div class="qa-col">
+        <div class="qa-title">常见问题 <span class="muted">已收录答案</span></div>
+        <div id="d-faq" class="qa-list"><p class="hint">加载中…</p></div>
+      </div>
+      <div class="qa-col">
+        <div class="qa-title">热门问题 <span class="muted">按提问频次</span></div>
+        <div id="d-hot" class="qa-list"><p class="hint">加载中…</p></div>
+      </div>
+    </div>
+    <h3>章节</h3>
+    <ul id="d-chapters" class="chapters"></ul>
+    <article id="d-read" hidden>
+      <div class="read-bar">
+        <h3 id="d-read-title"></h3>
+        <div id="d-langs" class="lang-bar" hidden></div>
+      </div>
+      <div id="d-read-body" class="md-body"></div>
+    </article>
+  </div>
+</div>
+
+<div id="toast" hidden></div>
+<script src="/static/vendor/marked.min.js"></script>
+<script src="/static/vendor/purify.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
