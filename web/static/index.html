@@ -14,6 +14,7 @@
     <button data-tab="upload">上传</button>
     <button data-tab="jobs">任务</button>
     <button data-tab="faq">常见问题</button>
+    <button data-tab="admin" id="nav-admin" hidden>用量</button>
   </nav>
   <div id="auth-anon" class="auth">
     <button id="btn-login">登录</button>
@@ -109,6 +110,18 @@
       <a href="/static/aibook-kit.zip" download>下载 aibook-kit.zip</a>，
       解压后运行 <code>install.ps1</code> 或 <code>bash install.sh</code>。</p>
     <div id="faq-list" class="list"></div>
+  </section>
+
+  <section id="tab-admin" class="tab">
+    <div class="bar">
+      <h2>用量看板</h2>
+      <select id="admin-days">
+        <option value="7" selected>近 7 天</option>
+        <option value="14">近 14 天</option>
+        <option value="30">近 30 天</option>
+      </select>
+    </div>
+    <div id="admin-stats" class="list"></div>
   </section>
 </main>
 

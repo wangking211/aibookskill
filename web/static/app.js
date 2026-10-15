@@ -40,6 +40,7 @@ function renderAuth() {
   $("#auth-anon").hidden = !!me;
   $("#auth-user").hidden = !me;
   if (me) $("#auth-name").textContent = me.display_name || me.identifier;
+  $("#nav-admin").hidden = !(me && me.role === "admin");
 }
 function openAuth(mode) {
   authMode = mode;
@@ -207,6 +208,81 @@ function renderChapter(content) {
     ? applyBilingual(content) : renderMd(content);
 }
 
+function highlightSnippet(snippet) {
+  const body = $("#d-read-body");
+  if (!body) return;
+  body.querySelectorAll(".src-hl").forEach((el) => {
+    const t = document.createTextNode(el.textContent);
+    el.replaceWith(t);
+  });
+  if (!snippet) return;
+  const probe = snippet.slice(0, 36);
+  if (!probe) return;
+  const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+  let node;
+  while ((node = walker.nextNode())) {
+    const idx = node.textContent.indexOf(probe);
+    if (idx >= 0) {
+      const range = document.createRange();
+      range.setStart(node, idx);
+      range.setEnd(node, idx + probe.length);
+      const span = document.createElement("span");
+      span.className = "src-hl";
+      range.surroundContents(span);
+      span.scrollIntoView({ behavior: "smooth", block: "center" });
+      return;
+    }
+  }
+  $("#d-read").scrollIntoView({ behavior: "smooth" });
+}
+
+async function jumpToSource(slug, chapterNo, snippet) {
+  if (!slug) return;
+  switchTab("library");
+  if (readState.slug !== slug) {
+    await openBook(slug);
+  }
+  if (chapterNo == null) return;
+  readState.no = chapterNo;
+  readState.lang = "orig";
+  await loadChapter();
+  setTimeout(() => highlightSnippet(snippet), 80);
+}
+
+document.addEventListener("click", (e) => {
+  const el = e.target.closest(".cite-link");
+  if (!el) return;
+  e.preventDefault();
+  const slug = el.dataset.slug;
+  const ch = el.dataset.ch ? parseInt(el.dataset.ch, 10) : null;
+  jumpToSource(slug, ch, el.dataset.snip || "");
+});
+
+function linkifyCitations(html, hits, defaultSlug) {
+  return html.replace(/【引用:([^】]+)】/g, (m, inner) => {
+    inner = String(inner).trim();
+    let match = null;
+    const libM = inner.match(/^《([^》]+)》[·・]?\s*(.*)$/);
+    if (libM) {
+      const bookTitle = libM[1], chapTitle = (libM[2] || "").trim();
+      match = (hits || []).find((h) =>
+        (h.book_title === bookTitle || h.book_slug === bookTitle) &&
+        (!chapTitle || h.chapter_title === chapTitle
+          || (h.chapter_title && h.chapter_title.includes(chapTitle))));
+    } else {
+      match = (hits || []).find((h) =>
+        h.chapter_title === inner
+        || (h.chapter_title && h.chapter_title.includes(inner)));
+    }
+    if (!match || match.chapter_no == null) return m;
+    const slug = match.book_slug || defaultSlug;
+    const snip = (match.lines && match.lines[0] && match.lines[0].snippet) || "";
+    return `<span class="cite-link" data-slug="${esc(slug)}"`
+      + ` data-ch="${match.chapter_no}" data-snip="${esc(snip)}">`
+      + `【引用:${esc(inner)}】</span>`;
+  });
+}
+
 function renderLangBar() {
   const bar = $("#d-langs");
   const has = readState.translations || [];
@@ -237,6 +313,7 @@ function switchTab(name) {
   if (name === "library") loadBooks();
   if (name === "jobs") { loadJobs(); jobsTimer = setInterval(loadJobs, 2500); }
   if (name === "faq") loadFaq();
+  if (name === "admin") loadAdminStats();
 }
 $("#nav").addEventListener("click", (e) => {
   const b = e.target.closest("button[data-tab]");
@@ -392,6 +469,39 @@ $("#d-chapters").addEventListener("click", (e) => {
   readState.lang = b.dataset.lang;
   loadChapter();
 });
+async function streamAsk(slug, question, onToken) {
+  const resp = await fetch("/api/ask/stream", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ slug, question, deep: false }),
+  });
+  if (!resp.ok || !resp.body) {
+    const err = await resp.json().catch(() => ({}));
+    throw new Error(err.error || ("HTTP " + resp.status));
+  }
+  const reader = resp.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "", done = null;
+  for (;;) {
+    const { value, done: d } = await reader.read();
+    if (d) break;
+    buf += dec.decode(value, { stream: true });
+    const parts = buf.split("\n\n");
+    buf = parts.pop();
+    for (const part of parts) {
+      const line = part.trim();
+      if (!line.startsWith("data:")) continue;
+      let obj;
+      try { obj = JSON.parse(line.slice(5).trim()); } catch { continue; }
+      if (obj.type === "token" && obj.text) onToken(obj.text);
+      else if (obj.type === "done") done = obj;
+      else if (obj.type === "error") throw new Error(obj.error || "stream error");
+    }
+  }
+  if (!done) throw new Error("stream ended without done");
+  return done;
+}
+
 $("#d-ask").addEventListener("click", async () => {
   const slug = $("#d-chapters").dataset.slug;
   const question = $("#d-question").value.trim();
@@ -401,19 +511,39 @@ $("#d-ask").addEventListener("click", async () => {
   btn.textContent = deep ? "深度思考中…" : "回答中…";
   btn.classList.add("busy");
   try {
-    const r = await jpost("/api/ask", { slug, question, deep });
+    let r;
+    if (!deep) {
+      $("#d-hits").innerHTML = '<div class="hit answer-block"><div class="src">AI 回答 · 流式</div><div class="line md-body" id="stream-body"></div></div>';
+      const bodyEl = $("#stream-body");
+      const chunks = [];
+      try {
+        r = await streamAsk(slug, question, (tok) => {
+          chunks.push(tok);
+          bodyEl.textContent = chunks.join("");
+        });
+        r.answer = chunks.join("");
+        r.hits = r.hits || [];
+        bodyEl.innerHTML = linkifyCitations(renderMd(r.answer), r.hits, slug);
+      } catch (se) {
+        r = await jpost("/api/ask", { slug, question, deep: false });
+      }
+    } else {
+      r = await jpost("/api/ask", { slug, question, deep });
+    }
     const modeTag = r.mode === "deep" ? " · 深度模式" : "";
     const cacheTag = r.cached ? " · 秒答缓存" : "";
     const head = r.answer
       ? `<div class="hit answer-block"><div class="src">AI 回答${modeTag}${cacheTag} · 已记入常见问题</div>`
-        + `<div class="line md-body">${renderMd(r.answer)}</div></div>`
+        + `<div class="line md-body">${linkifyCitations(renderMd(r.answer), r.hits, slug)}</div></div>`
       : `<div class="hit"><div class="src">暂未生成回答`
         + `${r.answer_error ? "（" + esc(r.answer_error) + "）" : ""}，以下是相关书摘</div></div>`;
     const body = r.hits.length
       ? r.hits.map((h) => `
         <div class="hit">
           <div class="src">${esc(h.chapter_title || h.path)} · ${h.lines.length} 处匹配</div>
-          ${h.lines.map((l) => `<div class="line">${esc(l.snippet)}</div>`).join("")}
+          ${h.lines.map((l) => `<div class="line cite-link" data-slug="${esc(slug)}"`
+            + ` data-ch="${h.chapter_no != null ? h.chapter_no : ""}" data-snip="${esc(l.snippet)}">`
+            + `${esc(l.snippet)}</div>`).join("")}
         </div>`).join("")
       : '<p class="hint">没有找到相关内容</p>';
     $("#d-hits").innerHTML = head + body;
@@ -592,14 +722,16 @@ async function askLibrary() {
     const nbooks = (r.books || []).length;
     const head = r.answer
       ? `<div class="hit answer-block"><div class="src">跨书回答 · 检索 ${nbooks} 本书 · 已记入常见问题</div>`
-        + `<div class="line md-body">${renderMd(r.answer)}</div></div>`
+        + `<div class="line md-body">${linkifyCitations(renderMd(r.answer), r.hits, "")}</div></div>`
       : `<div class="hit"><div class="src">暂未生成回答`
         + `${r.answer_error ? "（" + esc(r.answer_error) + "）" : ""}，以下是相关书摘</div></div>`;
     const body = (r.hits || []).length
       ? r.hits.map((h) => `
         <div class="hit">
           <div class="src">《${esc(h.book_title || h.book_slug)}》· ${esc(h.chapter_title || h.path)} · ${h.lines.length} 处匹配</div>
-          ${h.lines.map((l) => `<div class="line">${esc(l.snippet)}</div>`).join("")}
+          ${h.lines.map((l) => `<div class="line cite-link" data-slug="${esc(h.book_slug || "")}"`
+            + ` data-ch="${h.chapter_no != null ? h.chapter_no : ""}" data-snip="${esc(l.snippet)}">`
+            + `${esc(l.snippet)}</div>`).join("")}
         </div>`).join("")
       : '<p class="hint">没有找到相关内容</p>';
     $("#lib-result").innerHTML = head + body;
@@ -641,6 +773,34 @@ $("#faq-scope").addEventListener("change", loadFaq);$("#faq-list").addEventListe
     } catch (err) { fail(err); }
   }
 });
+
+async function loadAdminStats() {
+  const box = $("#admin-stats");
+  const days = parseInt($("#admin-days").value, 10) || 7;
+  box.innerHTML = '<p class="hint">加载中…</p>';
+  try {
+    const s = await jget("/api/admin/stats?days=" + days);
+    const fmtMs = (v) => v == null ? "—" : (v >= 1000 ? (v / 1000).toFixed(1) + "s" : v + "ms");
+    const row = (a) => `<tr><td>${esc(a.day || a.model)}</td><td>${a.count}</td>`
+      + `<td>${a.ok}</td><td>${(a.ok_rate * 100).toFixed(1)}%</td>`
+      + `<td>${fmtMs(a.p50_ms)}</td><td>${fmtMs(a.p95_ms)}</td></tr>`;
+    const tbl = (rows) => `<table class="stat-table"><thead><tr>`
+      + `<th>${days ? "日期" : ""}</th><th>调用</th><th>成功</th><th>成功率</th>`
+      + `<th>P50</th><th>P95</th></tr></thead><tbody>`
+      + rows.map(row).join("") + `</tbody></table>`;
+    box.innerHTML = `
+      <div class="stat-summary">
+        <div class="stat-card"><div class="stat-num">${s.total}</div><div class="stat-label">${days} 天调用</div></div>
+        <div class="stat-card"><div class="stat-num">${(s.ok_rate * 100).toFixed(1)}%</div><div class="stat-label">成功率</div></div>
+        <div class="stat-card"><div class="stat-num">${s.ok}</div><div class="stat-label">成功回答</div></div>
+      </div>
+      <div class="qa-col"><div class="qa-title">按模型</div>${(s.by_model || []).length ? tbl(s.by_model) : '<p class="hint">暂无数据</p>'}</div>
+      <div class="qa-col"><div class="qa-title">按天</div>${(s.by_day || []).length ? tbl(s.by_day) : '<p class="hint">暂无数据</p>'}</div>`;
+  } catch (e) {
+    box.innerHTML = `<p class="hint">加载失败: ${esc(e.message)}</p>`;
+  }
+}
+$("#admin-days").addEventListener("change", loadAdminStats);
 
 fetch("/api/me")
   .then((r) => (r.ok ? r.json() : null))

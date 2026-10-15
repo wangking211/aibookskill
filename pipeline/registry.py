@@ -138,6 +138,15 @@ CREATE TABLE IF NOT EXISTS index_lines(
   PRIMARY KEY(book_slug, path, line)
 );
 CREATE INDEX IF NOT EXISTS idx_index_lines_book ON index_lines(book_slug, path);
+CREATE TABLE IF NOT EXISTS index_embed(
+  book_slug TEXT NOT NULL,
+  path TEXT NOT NULL,
+  line INTEGER NOT NULL,
+  model TEXT,
+  dim INTEGER,
+  vec TEXT,
+  PRIMARY KEY(book_slug, path, line)
+);
 """
 
 MIGRATIONS = [
@@ -149,6 +158,10 @@ MIGRATIONS = [
     "ALTER TABLE jobs ADD COLUMN not_before BIGINT",
     "ALTER TABLE jobs ADD COLUMN worker_id TEXT",
     "ALTER TABLE jobs ADD COLUMN lease_until BIGINT",
+    "ALTER TABLE interactions ADD COLUMN model TEXT",
+    "ALTER TABLE interactions ADD COLUMN latency_ms INTEGER",
+    "ALTER TABLE interactions ADD COLUMN tokens_in INTEGER",
+    "ALTER TABLE interactions ADD COLUMN tokens_out INTEGER",
 ]
 
 
@@ -299,6 +312,15 @@ SCHEMA_PG = [
   PRIMARY KEY(book_slug, path, line)
 )""",
     "CREATE INDEX IF NOT EXISTS idx_index_lines_book ON index_lines(book_slug, path)",
+    """CREATE TABLE IF NOT EXISTS index_embed(
+  book_slug TEXT NOT NULL,
+  path TEXT NOT NULL,
+  line INTEGER NOT NULL,
+  model TEXT,
+  dim INTEGER,
+  vec TEXT,
+  PRIMARY KEY(book_slug, path, line)
+)""",
 ]
 
 _PG_SINGLETONS = {}
@@ -929,12 +951,72 @@ def get_translation(con, slug, lang):
 
 
 def log_interaction(con, space_id, user_name, slug, channel, tool, question, result_count,
-                    answer=None):
+                    answer=None, model=None, latency_ms=None, tokens_in=None, tokens_out=None):
     con.execute(
-        "INSERT INTO interactions(space_id,user_name,slug,channel,tool,question,result_count,answer)"
-        " VALUES(?,?,?,?,?,?,?,?)",
-        (space_id, user_name, slug, channel, tool, question, result_count, answer))
+        "INSERT INTO interactions(space_id,user_name,slug,channel,tool,question,result_count,"
+        "answer,model,latency_ms,tokens_in,tokens_out)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        (space_id, user_name, slug, channel, tool, question, result_count, answer,
+         model, latency_ms, tokens_in, tokens_out))
     con.commit()
+
+
+def admin_stats(con, days=7):
+    """最近 N 天的问答用量统计：总量、按天、按模型成功率与延迟。"""
+    since = int(time.time()) - days * 86400
+    rows = con.execute(
+        "SELECT tool, model, answer, latency_ms, created_at FROM interactions"
+        " WHERE created_at>=? AND tool IN ('ask','ask_library')",
+        (since,)).fetchall()
+    total = len(rows)
+    ok = sum(1 for r in rows if r["answer"])
+    by_day = {}
+    by_model = {}
+    for r in rows:
+        day = time.strftime("%Y-%m-%d", time.localtime(int(r["created_at"] or 0)))
+        d = by_day.setdefault(day, {"count": 0, "ok": 0, "lat": []})
+        d["count"] += 1
+        if r["answer"]:
+            d["ok"] += 1
+        if r["latency_ms"]:
+            d["lat"].append(int(r["latency_ms"]))
+        m = r["model"] or ""
+        if m:
+            mm = by_model.setdefault(m, {"count": 0, "ok": 0, "lat": []})
+            mm["count"] += 1
+            if r["answer"]:
+                mm["ok"] += 1
+            if r["latency_ms"]:
+                mm["lat"].append(int(r["latency_ms"]))
+
+    def _pct(vals, p):
+        if not vals:
+            return None
+        vals = sorted(vals)
+        k = max(0, min(len(vals) - 1, int(len(vals) * p) - 1))
+        return vals[k]
+
+    days_out = []
+    for day in sorted(by_day):
+        d = by_day[day]
+        days_out.append({
+            "day": day, "count": d["count"], "ok": d["ok"],
+            "ok_rate": round(d["ok"] / d["count"], 3) if d["count"] else 0,
+            "p50_ms": _pct(d["lat"], 0.5), "p95_ms": _pct(d["lat"], 0.95),
+        })
+    models_out = []
+    for m in sorted(by_model, key=lambda x: -by_model[x]["count"]):
+        mm = by_model[m]
+        models_out.append({
+            "model": m, "count": mm["count"], "ok": mm["ok"],
+            "ok_rate": round(mm["ok"] / mm["count"], 3) if mm["count"] else 0,
+            "p50_ms": _pct(mm["lat"], 0.5), "p95_ms": _pct(mm["lat"], 0.95),
+        })
+    return {
+        "days": days, "total": total, "ok": ok,
+        "ok_rate": round(ok / total, 3) if total else 0,
+        "by_day": days_out, "by_model": models_out,
+    }
 
 
 def faq_groups(con, scope_slug=None, limit=50):
@@ -1152,7 +1234,7 @@ def _index_write(con, slug, files, lines):
 
 
 def reindex_book(con, slug, skill_dir, sig=None, max_line=MAX_INDEX_LINE_CHARS):
-    """重建某书的行级索引。返回 {files, lines} 统计。"""
+    """全量重建某书的行级索引（删光重插）。返回 {files, lines} 统计。"""
     root = Path(skill_dir)
     sig = _disk_sig(skill_dir) if sig is None else sig
     files, lines = [], []
@@ -1171,14 +1253,85 @@ def reindex_book(con, slug, skill_dir, sig=None, max_line=MAX_INDEX_LINE_CHARS):
     return {"files": len(files), "lines": len(lines)}
 
 
+def reindex_book_incremental(con, slug, skill_dir, sig=None,
+                             max_line=MAX_INDEX_LINE_CHARS):
+    """按文件 diff 增量更新索引：只重抽新增/变更文件的行，删除消失文件的行，
+    未变文件不动。返回 {files, lines, added, changed, removed, unchanged} 统计。"""
+    root = Path(skill_dir)
+    sig = _disk_sig(skill_dir) if sig is None else sig
+    old_rows = con.execute(
+        "SELECT path, mtime, file_size FROM index_files WHERE book_slug=?",
+        (slug,)).fetchall()
+    old = {r["path"]: (int(r["mtime"] or 0), int(r["file_size"] or 0))
+           for r in old_rows}
+    new = {rel: (mtime, size) for rel, mtime, size in sig}
+
+    added = [rel for rel in new if rel not in old]
+    changed = [rel for rel in new
+               if rel in old and old[rel] != new[rel]]
+    removed = [rel for rel in old if rel not in new]
+    unchanged = [rel for rel in new
+                 if rel in old and old[rel] == new[rel]]
+
+    if not added and not changed and not removed:
+        return {"files": len(unchanged), "lines": 0,
+                "added": 0, "changed": 0, "removed": 0,
+                "unchanged": len(unchanged)}
+
+    files_ins, lines_ins = [], []
+    for rel in added + changed:
+        mtime, size = new[rel]
+        try:
+            text = (root / rel).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        files_ins.append((slug, rel, _index_lang(rel), estimate_tokens(text),
+                          mtime, size))
+        for i, ln in enumerate(text.splitlines(), 1):
+            s = ln.strip()
+            if s:
+                lines_ins.append((slug, rel, i, s[:max_line]))
+
+    ins_f = ("INSERT INTO index_files(book_slug,path,lang,tokens,mtime,file_size)"
+             " VALUES(?,?,?,?,?,?)")
+    ins_l = "INSERT INTO index_lines(book_slug,path,line,text) VALUES(?,?,?,?)"
+    del_paths = removed + changed
+
+    def _apply():
+        for rel in del_paths:
+            con.execute(
+                "DELETE FROM index_lines WHERE book_slug=? AND path=?",
+                (slug, rel))
+            con.execute(
+                "DELETE FROM index_files WHERE book_slug=? AND path=?",
+                (slug, rel))
+        if files_ins:
+            con.executemany(ins_f, files_ins)
+        if lines_ins:
+            con.executemany(ins_l, lines_ins)
+
+    if _pg(con):
+        with con.transaction():
+            _apply()
+    else:
+        _apply()
+        con.commit()
+
+    return {"files": len(files_ins), "lines": len(lines_ins),
+            "added": len(added), "changed": len(changed),
+            "removed": len(removed), "unchanged": len(unchanged)}
+
+
 def ensure_index(con, slug, skill_dir, force=False):
-    """索引缺失或与磁盘不一致时重建；未变化返回 None。"""
+    """索引缺失或与磁盘不一致时增量重建；未变化返回 None。force=True 全量重建。"""
     sig = _disk_sig(skill_dir)
     if not sig:
         return None
     if not force and index_status(con, slug) == sig:
         return None
-    return reindex_book(con, slug, skill_dir, sig=sig)
+    if force:
+        return reindex_book(con, slug, skill_dir, sig=sig)
+    return reindex_book_incremental(con, slug, skill_dir, sig=sig)
 
 
 def _cap_per_book(items, per_book):
@@ -1262,6 +1415,155 @@ def search_auto(con, slug, root, query, limit_files=6, max_lines=3):
     return search_files(root, query, limit_files, max_lines)
 
 
+def _cosine(a, b):
+    dot = sum(x * y for x, y in zip(a, b))
+    na = sum(x * x for x in a) ** 0.5
+    nb = sum(y * y for y in b) ** 0.5
+    if not na or not nb:
+        return 0.0
+    return dot / (na * nb)
+
+
+def embed_book(con, slug, cfg, batch=64):
+    """为某书全部已索引行生成嵌入并写入 index_embed。返回嵌入行数。"""
+    import llm
+    base, key, model = llm._embedding_endpoint(cfg)
+    if not base:
+        return 0
+    rows = con.execute(
+        "SELECT path, line, text FROM index_lines WHERE book_slug=?",
+        (slug,)).fetchall()
+    if not rows:
+        return 0
+    items = [(r["path"], r["line"], r["text"]) for r in rows]
+    written = 0
+    for i in range(0, len(items), batch):
+        chunk = items[i:i + batch]
+        vecs = llm.embed_texts(cfg, [t for _, _, t in chunk], timeout=60)
+        if not vecs:
+            continue
+        dim = len(vecs[0])
+        pairs = [(slug, p, ln, model, dim, json.dumps(v))
+                 for (p, ln, _), v in zip(chunk, vecs)]
+        _embed_write(con, pairs)
+        written += len(pairs)
+    return written
+
+
+def _embed_write(con, pairs):
+    ins = ("INSERT INTO index_embed(book_slug,path,line,model,dim,vec)"
+           " VALUES(?,?,?,?,?,?) ON CONFLICT(book_slug,path,line)"
+           " DO UPDATE SET model=excluded.model, dim=excluded.dim, vec=excluded.vec")
+    if _pg(con):
+        with con.transaction():
+            con.executemany(ins, pairs)
+        return
+    con.executemany(ins, pairs)
+    con.commit()
+
+
+def _vector_search(con, slugs, query_vec, top_files=20, max_lines=3, cfg=None):
+    """在 index_embed 上做余弦近邻检索，按文件聚合。结果结构与 _index_terms 相同。"""
+    ph = ",".join("?" * len(slugs))
+    rows = con.execute(
+        f"SELECT book_slug, path, line, vec FROM index_embed"
+        f" WHERE book_slug IN ({ph})", list(slugs)).fetchall()
+    if not rows:
+        return []
+    agg = {}
+    for r in rows:
+        try:
+            v = json.loads(r["vec"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        score = _cosine(query_vec, v)
+        if score <= 0:
+            continue
+        key = (r["book_slug"], r["path"])
+        a = agg.get(key)
+        if a is None:
+            a = agg[key] = {"score": 0, "lines": {}}
+        a["score"] += score
+        a["lines"].setdefault(r["line"], (score, None))
+    # 取每文件 top 行片段（从 index_lines 补 snippet）
+    out = []
+    for (bs, path), v in agg.items():
+        line_nos = sorted(v["lines"], key=lambda n: -v["lines"][n][0])[:max_lines]
+        snippets = {}
+        if line_nos:
+            lph = ",".join("?" * len(line_nos))
+            for lr in con.execute(
+                    f"SELECT line, text FROM index_lines"
+                    f" WHERE book_slug=? AND path=? AND line IN ({lph})",
+                    [bs, path] + line_nos):
+                snippets[lr["line"]] = lr["text"][:180]
+        lines = [{"line": n, "snippet": snippets.get(n, "")} for n in line_nos]
+        out.append({"book_slug": bs, "path": path, "score": v["score"],
+                    "lines": lines, "tokens": 0})
+    out.sort(key=lambda x: (-x["score"], x["book_slug"], x["path"]))
+    return out[:top_files]
+
+
+def _rrf_fuse(lexical, vector, k=60):
+    """Reciprocal Rank Fusion：合并词面与向量两路结果。"""
+    scores = {}
+    payloads = {}
+    for rank, it in enumerate(lexical, 1):
+        key = (it.get("book_slug", ""), it["path"])
+        scores[key] = scores.get(key, 0) + 1.0 / (k + rank)
+        payloads[key] = it
+    for rank, it in enumerate(vector, 1):
+        key = (it.get("book_slug", ""), it["path"])
+        scores[key] = scores.get(key, 0) + 1.0 / (k + rank)
+        if key not in payloads:
+            payloads[key] = it
+        else:
+            # 合并行片段
+            old = payloads[key]
+            seen = {(l["line"]) for l in old.get("lines", [])}
+            for l in it.get("lines", []):
+                if l["line"] not in seen:
+                    old.setdefault("lines", []).append(l)
+            old["score"] = scores[key]
+    out = []
+    for key, sc in scores.items():
+        it = dict(payloads[key])
+        it["score"] = sc
+        out.append(it)
+    out.sort(key=lambda x: (-x["score"], x.get("book_slug", ""), x["path"]))
+    return out
+
+
+def search_index_hybrid(con, slugs, query, cfg, limit_files=6, max_lines=3,
+                        per_book=0):
+    """混合检索：词面 + 向量 RRF 融合。未配置嵌入或无向量时退化为纯词面。"""
+    lexical = search_index(con, slugs, query, limit_files, max_lines, per_book)
+    try:
+        import llm
+        base, _key, _m = llm._embedding_endpoint(cfg)
+    except Exception:
+        base = None
+    if not base:
+        return lexical
+    try:
+        qvec = llm.embed_texts(cfg, [query], timeout=20)
+    except Exception:
+        qvec = None
+    if not qvec or not qvec[0]:
+        return lexical
+    try:
+        vector = _vector_search(con, slugs, qvec[0],
+                                top_files=limit_files * 2, max_lines=max_lines)
+    except Exception:
+        vector = []
+    if not vector:
+        return lexical
+    fused = _rrf_fuse(lexical, vector)
+    if per_book:
+        fused = _cap_per_book(fused, per_book)
+    return fused[:limit_files]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default=str(Path(__file__).parent / "registry.db"))
@@ -1271,6 +1573,9 @@ def main():
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--reindex", nargs="?", const="", default=None,
                     help="重建索引：留空=全部；或给 slug 列表(逗号分隔)")
+    ap.add_argument("--embed", nargs="?", const="", default=None,
+                    help="生成行级嵌入(需配置 embedding_model)：留空=全部；或 slug 列表")
+    ap.add_argument("--config", default=str(Path(__file__).parent / "config.json"))
     a = ap.parse_args()
     con = connect(a.db)
     if a.init:
@@ -1279,6 +1584,21 @@ def main():
         n = import_existing(con, "C:/Users/Icy/.agents/skills")
         m = link_sources(con, a.sources)
         print(f"imported {n} skills, linked {m} sources")
+    if a.embed is not None:
+        try:
+            cfg = json.loads(Path(a.config).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            cfg = {}
+        want = {s.strip() for s in a.embed.split(",") if s.strip()}
+        rows = con.execute("SELECT slug FROM books").fetchall()
+        total = 0
+        for r in rows:
+            if want and r["slug"] not in want:
+                continue
+            n = embed_book(con, r["slug"], cfg)
+            total += n
+            print(f"{r['slug']:<32} {n:>6} embeds")
+        print(f"embedded {total} lines")
     if a.reindex is not None:
         want = {s.strip() for s in a.reindex.split(",") if s.strip()}
         rows = con.execute("SELECT slug, skill_path FROM books").fetchall()

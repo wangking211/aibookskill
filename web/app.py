@@ -17,7 +17,8 @@ import registry
 import llm
 import cosutil
 from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import (FileResponse, JSONResponse, PlainTextResponse,
+                               StreamingResponse)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -68,7 +69,8 @@ def require_user(request):
 
 def public_user(u):
     return {"identifier": u["identifier"], "id_type": u["id_type"],
-            "display_name": u["display_name"], "space_id": u["space_id"]}
+            "display_name": u["display_name"], "space_id": u["space_id"],
+            "role": u["role"] or "user"}
 
 
 def is_admin(u):
@@ -84,7 +86,16 @@ def visible_spaces(user):
 
 def _hits_for(slug, root, question, limit_files=6, max_lines=3):
     """在独立线程里检索：用 thread-local 新建连接，优先走内容索引。"""
-    return registry.search_auto(con(), slug, root, question, limit_files, max_lines)
+    c = con()
+    try:
+        if not registry.index_status(c, slug):
+            registry.ensure_index(c, slug, root)
+        if registry.index_status(c, slug):
+            return registry.search_index_hybrid(
+                c, [slug], question, CFG, limit_files, max_lines)
+    except Exception:
+        pass
+    return registry.search_files(root, question, limit_files, max_lines)
 
 
 def _visible_books(c, user):
@@ -98,9 +109,9 @@ def _visible_books(c, user):
 def _chapter_titles(c, slugs):
     out = {}
     for s in slugs:
-        for r in c.execute("SELECT title,path FROM chapters WHERE book_slug=?", (s,)):
+        for r in c.execute("SELECT no,title,path FROM chapters WHERE book_slug=?", (s,)):
             if r["path"]:
-                out[(s, Path(r["path"]).name)] = r["title"]
+                out[(s, Path(r["path"]).name)] = {"no": r["no"], "title": r["title"]}
     return out
 
 
@@ -117,8 +128,8 @@ def _ensure_indexes(slugs, skills_home):
 
 
 def _library_hits(slugs, question, limit_files, max_lines, per_book):
-    return registry.search_index(con(), slugs, question, limit_files, max_lines,
-                                 per_book)
+    return registry.search_index_hybrid(con(), slugs, question, CFG,
+                                        limit_files, max_lines, per_book)
 
 
 @app.on_event("startup")
@@ -780,6 +791,7 @@ async def api_ask(request: Request, body: AskBody):
             return JSONResponse(
                 {"error": "深度提问排队较多，请稍后再试"}, status_code=429)
         root = (SKILLS_HOME / body.slug).resolve()
+        t0 = time.time()
         try:
             answer, info = await asyncio.wait_for(llm.deep_answer_async(
                 CFG, body.question, b["title"] or "", b["intro"] or "",
@@ -801,15 +813,97 @@ async def api_ask(request: Request, body: AskBody):
             if skill_md.exists() else ""
         if b["intro"]:
             fallback = f"{b['intro']}\n\n{fallback}" if fallback else b["intro"]
+        t0 = time.time()
         answer, info = await llm.answer_question_async(
             CFG, body.question, hits, b["title"] or "", fallback)
+    latency_ms = int((time.time() - t0) * 1000)
+    model = info if answer else None
     if answer and nq:
-        registry.put_cached_answer(c, body.slug, nq, mode, body.question, answer)
+        registry.put_cached_answer(c, body.slug, nq, mode, body.question, answer, model=model or "")
     registry.log_interaction(c, user["space_id"], user["display_name"], body.slug,
-                             "web", "ask", body.question, len(hits), answer=answer)
+                             "web", "ask", body.question, len(hits), answer=answer,
+                             model=model, latency_ms=latency_ms)
     return {"hits": hits, "answer": answer,
             "answer_error": None if answer else info,
             "mode": mode, "cached": False}
+
+
+@app.post("/api/ask/stream")
+async def api_ask_stream(request: Request, body: AskBody):
+    """SSE 流式问答（仅 fast 模式）。事件：token / done / error。"""
+    user = require_user(request)
+    c = con()
+    b = registry.find_book(c, body.slug)
+    if not b:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    chapters = {r["path"]: dict(r) for r in c.execute(
+        "SELECT no,title,path FROM chapters WHERE book_slug=?", (body.slug,))}
+    skill_root = (SKILLS_HOME / body.slug).as_posix()
+
+    def enrich(hs):
+        for h in hs:
+            ch = chapters.get(h["path"]) or chapters.get(f"{skill_root}/{h['path']}")
+            h["chapter_no"] = ch["no"] if ch else None
+            h["chapter_title"] = ch["title"] if ch else h["path"]
+        return hs
+
+    hits = enrich(await asyncio.to_thread(
+        _hits_for, body.slug, SKILLS_HOME / body.slug, body.question, 6, 3))
+    nq = registry.norm_question(body.question)
+    mode = "fast"
+    cached = registry.get_cached_answer(c, body.slug, nq, mode) if nq else None
+
+    def sse(obj):
+        return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+    if cached:
+        async def gen_cached():
+            yield sse({"type": "token", "text": cached})
+            yield sse({"type": "done", "hits": hits, "model": None,
+                       "cached": True, "mode": mode})
+        registry.log_interaction(c, user["space_id"], user["display_name"], body.slug,
+                                 "web", "ask", body.question, len(hits), answer=cached)
+        return StreamingResponse(gen_cached(), media_type="text/event-stream")
+
+    skill_md = SKILLS_HOME / body.slug / "SKILL.md"
+    fallback = skill_md.read_text(encoding="utf-8", errors="replace")[:3000] \
+        if skill_md.exists() else ""
+    if b["intro"]:
+        fallback = f"{b['intro']}\n\n{fallback}" if fallback else b["intro"]
+    system, user_prompt = llm._answer_prompt(body.question, hits, b["title"] or "", fallback)
+    if user_prompt is None:
+        return JSONResponse({"error": "no excerpts"}, status_code=400)
+
+    t0 = time.time()
+    chunks = []
+    model_used = None
+
+    async def gen_stream():
+        nonlocal model_used
+        stream, model, err = await llm.chat_async_stream(CFG, system, user_prompt, 90)
+        if err or stream is None:
+            yield sse({"type": "error", "error": err or "stream unavailable"})
+            return
+        model_used = model
+        try:
+            async for tok in stream:
+                chunks.append(tok)
+                yield sse({"type": "token", "text": tok})
+        except Exception as e:
+            yield sse({"type": "error", "error": f"stream interrupted: {e}"})
+            return
+        answer = "".join(chunks)
+        latency_ms = int((time.time() - t0) * 1000)
+        if answer and nq:
+            registry.put_cached_answer(c, body.slug, nq, mode, body.question, answer,
+                                       model=model_used or "")
+        registry.log_interaction(c, user["space_id"], user["display_name"], body.slug,
+                                 "web", "ask", body.question, len(hits), answer=answer,
+                                 model=model_used, latency_ms=latency_ms)
+        yield sse({"type": "done", "hits": hits, "model": model_used,
+                   "cached": False, "mode": mode})
+
+    return StreamingResponse(gen_stream(), media_type="text/event-stream")
 
 
 class LibraryAskBody(BaseModel):
@@ -850,18 +944,26 @@ async def api_library_ask(request: Request, body: LibraryAskBody):
         for h in hits:
             b = by_slug.get(h.get("book_slug")) or {}
             h["book_title"] = b.get("title") or h.get("book_slug") or ""
-            h["chapter_title"] = titles.get(
-                (h.get("book_slug"), Path(h.get("path") or "").name)) \
-                or Path(h.get("path") or "").stem
+            meta = titles.get((h.get("book_slug"), Path(h.get("path") or "").name))
+            if meta:
+                h["chapter_no"] = meta["no"]
+                h["chapter_title"] = meta["title"]
+            else:
+                h["chapter_no"] = None
+                h["chapter_title"] = Path(h.get("path") or "").stem
         catalog = "\n".join(f"- 《{b['title'] or b['slug']}》" for b in books)
+        t0 = time.time()
         answer, info = await llm.answer_library_async(
             CFG, q, hits, catalog, 150 if body.deep else 90)
+        latency_ms = int((time.time() - t0) * 1000)
+        model = info if answer else None
     finally:
         DEEP_SEM.release()
 
     if answer:
         registry.log_interaction(c, user["space_id"], user["display_name"], "",
-                                 "web", "ask_library", q, len(hits), answer=answer)
+                                 "web", "ask_library", q, len(hits), answer=answer,
+                                 model=model, latency_ms=latency_ms)
     return {"hits": hits, "answer": answer,
             "answer_error": None if answer else info,
             "books": [b["slug"] for b in books], "deep": bool(body.deep)}
@@ -945,6 +1047,14 @@ async def api_faq_answer(request: Request, body: FaqGenBody):
                                    registry.norm_question(body.question),
                                    "fast", body.question, answer)
     return {"answer": answer}
+
+
+@app.get("/api/admin/stats")
+def api_admin_stats(request: Request, days: int = 7):
+    user = require_user(request)
+    if not is_admin(user):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    return registry.admin_stats(con(), max(1, min(days, 90)))
 
 
 class AuthBody(BaseModel):

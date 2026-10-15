@@ -260,6 +260,38 @@ tbody tr:hover { background: #f8f9fb; }
   margin-top: 5px; cursor: default;
 }
 .qa-item.askable:hover .qa-q { color: var(--accent); }
+.cite-link {
+  cursor: pointer;
+  color: var(--accent);
+  text-decoration: underline;
+  text-decoration-style: dotted;
+  text-underline-offset: 3px;
+}
+.cite-link:hover { text-decoration-style: solid; }
+.src-hl {
+  background: rgba(255, 214, 10, 0.35);
+  border-radius: 3px;
+  padding: 0 2px;
+}
+.line.cite-link { cursor: pointer; }
+.line.cite-link:hover { color: var(--accent); }
+.stat-summary {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;
+  margin-bottom: 14px;
+}
+.stat-card {
+  background: var(--card); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 14px; text-align: center;
+}
+.stat-num { font-size: 26px; font-weight: 700; color: var(--accent); }
+.stat-label { font-size: 12px; color: var(--muted); margin-top: 4px; }
+.stat-table {
+  width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 6px;
+}
+.stat-table th, .stat-table td {
+  text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line);
+}
+.stat-table th { color: var(--muted); font-weight: 600; }
 @media (max-width: 640px) {
   header { padding: 10px 12px; }
   main { padding: 12px; }

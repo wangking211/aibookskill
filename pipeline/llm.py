@@ -260,6 +260,56 @@ async def _post_async(cfg, payload, timeout=90):
         return None, model, f"llm error: {e}"
 
 
+def _embedding_endpoint(cfg):
+    """返回 (base, key, model) 或 (None, None, None)（未配置嵌入）。"""
+    model = cfg.get("embedding_model") or ""
+    if not model:
+        return None, None, None
+    base = (cfg.get("embedding_base_url") or "").rstrip("/")
+    if not base:
+        provider = model.split("/", 1)[0] if "/" in model else ""
+        base = ENDPOINTS.get(provider, "")
+        if base.endswith("/chat/completions"):
+            base = base.rsplit("/chat/completions", 1)[0] + "/embeddings"
+    if not base.endswith("/embeddings"):
+        base = base + "/embeddings" if base else ""
+    key = cfg.get("embedding_api_key") or cfg.get("api_key") or ""
+    if not key and cfg.get("api_key_env"):
+        key = os.environ.get(cfg["api_key_env"], "")
+    short = model.split("/", 1)[1] if "/" in model else model
+    return (base, key, short) if base and short else (None, None, None)
+
+
+def embed_texts(cfg, texts, timeout=30):
+    """批量嵌入。未配置或失败返回 None（调用方应回退到纯词面检索）。"""
+    base, key, model = _embedding_endpoint(cfg)
+    if not base or not texts:
+        return None
+    payload = {"model": model, "input": list(texts)}
+    data, _m, err = _post_sync_raw(base, payload, key, timeout)
+    if err:
+        return None
+    try:
+        items = sorted(data["data"], key=lambda x: x.get("index", 0))
+        vecs = [it["embedding"] for it in items]
+        return vecs if len(vecs) == len(texts) else None
+    except (KeyError, TypeError):
+        return None
+
+
+def _post_sync_raw(base, payload, key, timeout=30):
+    try:
+        req = urllib.request.Request(
+            base, data=json.dumps(payload).encode("utf-8"), method="POST",
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {key}"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = r.read().decode("utf-8")
+        return json.loads(body) if body else None, None, None
+    except Exception as e:
+        return None, None, f"embed error: {e}"
+
+
 async def chat_async(cfg, system, user, timeout=90):
     errs = []
     mt = _max_tokens(cfg)
@@ -279,6 +329,89 @@ async def chat_async(cfg, system, user, timeout=90):
             return text, model
         errs.append(f"{model}: {err or 'empty reply'}")
     return None, (" | ".join(errs) if errs else "未配置 answer_model")
+
+
+async def _post_stream_async(cfg, payload, timeout=90):
+    """流式 POST：返回 (async_generator, model, err)。generator 产出增量文本。"""
+    model, base, key, err = resolve(cfg)
+    if err:
+        return None, None, err
+    payload = {**payload, "model": model, "stream": True}
+    import httpx
+    try:
+        client = _get_async_client()
+        req = client.build_request(
+            "POST", base, json=payload,
+            headers={"Authorization": f"Bearer {key}"}, timeout=timeout)
+        resp = await client.send(req, stream=True)
+        resp.raise_for_status()
+    except Exception as e:
+        return None, model, f"llm stream error: {e}"
+
+    async def gen():
+        try:
+            async for line in resp.aiter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                data_str = line[5:].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                text = delta.get("content") or ""
+                if text:
+                    yield text
+        finally:
+            await resp.aclose()
+
+    return gen(), model, None
+
+
+async def chat_async_stream(cfg, system, user, timeout=90):
+    """流式问答：yield 增量文本；末尾通过返回值难以传递 model，
+    故用属性挂在 generator 上（实际用法：async for chunk, 最终 model 见函数内 log）。
+    返回 (generator, model_used, err)。若整链失败，generator 产出空、err 非空。"""
+    errs = []
+    mt = _max_tokens(cfg)
+    allow_r = bool(cfg.get("reasoning_fallback"))
+    for model in _answer_chain(cfg):
+        sub = {**cfg, "answer_model": model}
+        to = _model_timeout(cfg, model, timeout)
+        if _is_opencode_model(sub):
+            continue  # opencode serve 不支持流式，跳过
+        messages = [{"role": "system", "content": system},
+                    {"role": "user", "content": user}]
+        gen, _m, err = await _post_stream_async(
+            sub, {"messages": messages, "temperature": 0.3, "max_tokens": mt}, to)
+        if err or gen is None:
+            errs.append(f"{model}: {err or 'no stream'}")
+            continue
+        # 先探一个 chunk 判断是否立即失败/空回复
+        buffer = []
+        first = None
+        try:
+            async for chunk in gen:
+                first = chunk
+                break
+        except Exception as e:
+            errs.append(f"{model}: stream failed at start: {e}")
+            continue
+        if first is None:
+            errs.append(f"{model}: empty stream")
+            continue
+
+        async def chained(g=gen, f=first):
+            yield f
+            async for c in g:
+                yield c
+        return chained(), model, None
+    return None, None, (" | ".join(errs) if errs else "未配置 answer_model 或不支持流式")
 
 
 ANSWER_SYS = (
