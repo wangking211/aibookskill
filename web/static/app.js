@@ -216,24 +216,77 @@ function highlightSnippet(snippet) {
     el.replaceWith(t);
   });
   if (!snippet) return;
-  const probe = snippet.slice(0, 36);
+  // snippet is raw markdown; the rendered chapter has no emphasis tokens.
+  let probe = snippet
+    .replace(/…/g, "")
+    .replace(/[`*_#>|]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 36);
   if (!probe) return;
+  // Collect all text nodes; build a whitespace-normalized view with an
+  // original-offset map so probes survive markdown node splits and
+  // newline/space differences.
   const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
-  let node;
+  const nodes = [];
+  let full = "", node;
   while ((node = walker.nextNode())) {
-    const idx = node.textContent.indexOf(probe);
-    if (idx >= 0) {
-      const range = document.createRange();
-      range.setStart(node, idx);
-      range.setEnd(node, idx + probe.length);
-      const span = document.createElement("span");
-      span.className = "src-hl";
-      range.surroundContents(span);
-      span.scrollIntoView({ behavior: "smooth", block: "center" });
-      return;
+    nodes.push({ node, start: full.length, text: node.textContent });
+    full += node.textContent;
+  }
+  const norm = [], map = [];
+  let lastSpace = true;
+  for (let i = 0; i < full.length; i++) {
+    if (/\s/.test(full[i])) {
+      if (lastSpace) continue;
+      norm.push(" "); map.push(i); lastSpace = true;
+    } else {
+      norm.push(full[i]); map.push(i); lastSpace = false;
     }
   }
-  $("#d-read").scrollIntoView({ behavior: "smooth" });
+  const normStr = norm.join("");
+  const probeNorm = probe.replace(/\s+/g, " ");
+  let idx = full.indexOf(probe);
+  let endIdx = idx + probe.length;
+  if (idx < 0) {
+    const ni = normStr.indexOf(probeNorm);
+    if (ni >= 0) {
+      idx = map[ni];
+      endIdx = map[ni + probeNorm.length - 1] + 1;
+    }
+  }
+  if (idx < 0) {
+    // last resort: probe tail (index snippets may carry a leading prefix)
+    const tail = probeNorm.slice(-18);
+    const ni = tail.length >= 8 ? normStr.indexOf(tail) : -1;
+    if (ni >= 0) {
+      idx = map[ni];
+      endIdx = map[ni + tail.length - 1] + 1;
+    }
+  }
+  if (idx < 0) {
+    $("#d-read").scrollIntoView({ behavior: "smooth" });
+    return;
+  }
+  // Wrap [idx, endIdx) across possibly multiple text nodes.
+  let firstSpan = null;
+  for (const it of nodes) {
+    const nStart = it.start, nEnd = it.start + it.text.length;
+    if (nEnd <= idx || nStart >= endIdx) continue;
+    const from = Math.max(idx, nStart) - nStart;
+    const to = Math.min(endIdx, nEnd) - nStart;
+    if (to <= from) continue;
+    const range = document.createRange();
+    range.setStart(it.node, from);
+    range.setEnd(it.node, to);
+    const span = document.createElement("span");
+    span.className = "src-hl";
+    try { range.surroundContents(span); }
+    catch (e) { span.appendChild(range.extractContents()); range.insertNode(span); }
+    if (!firstSpan) firstSpan = span;
+  }
+  if (firstSpan) firstSpan.scrollIntoView({ behavior: "smooth", block: "center" });
+  else $("#d-read").scrollIntoView({ behavior: "smooth" });
 }
 
 async function jumpToSource(slug, chapterNo, snippet) {
