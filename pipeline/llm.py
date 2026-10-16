@@ -87,6 +87,25 @@ def _model_timeout(cfg, model, default):
     return default
 
 
+def _acc_usage(usage_out, data):
+    """把 OpenAI usage 累计进 usage_out（tokens_in/tokens_out）。多轮调用累加；
+    usage_out 为 None 时不采集（向后兼容，返回签名不变）。"""
+    if not isinstance(usage_out, dict) or not isinstance(data, dict):
+        return
+    u = data.get("usage")
+    if not isinstance(u, dict):
+        return
+    for keys, dst in ((("prompt_tokens", "input_tokens"), "tokens_in"),
+                      (("completion_tokens", "output_tokens"), "tokens_out")):
+        for k in keys:
+            if u.get(k) is not None:
+                try:
+                    usage_out[dst] = int(usage_out.get(dst) or 0) + int(u[k])
+                except (TypeError, ValueError):
+                    pass
+                break
+
+
 def _msg_content(data, allow_reasoning=False):
     """取回复正文。推理模型（如 deepseek-v4-flash）可能把 token 预算全花在
     reasoning_content 上导致 content 为空：此时视为失败、交给链上下一个模型，
@@ -206,7 +225,7 @@ def _post(cfg, payload, timeout=90):
         return None, model, f"llm error: {e}"
 
 
-def chat(cfg, system, user, timeout=90):
+def chat(cfg, system, user, timeout=90, usage_out=None):
     errs = []
     mt = _max_tokens(cfg)
     allow_r = bool(cfg.get("reasoning_fallback"))
@@ -221,6 +240,8 @@ def chat(cfg, system, user, timeout=90):
                              {"role": "user", "content": user}],
                 "temperature": 0.3, "max_tokens": mt}, to)
             text = None if err else _msg_content(data, allow_r)
+            if not err:
+                _acc_usage(usage_out, data)
         if not err and text:
             return text, model
         errs.append(f"{model}: {err or 'empty reply'}")
@@ -280,12 +301,15 @@ def _embedding_endpoint(cfg):
     return (base, key, short) if base and short else (None, None, None)
 
 
-def embed_texts(cfg, texts, timeout=30):
-    """批量嵌入。未配置或失败返回 None（调用方应回退到纯词面检索）。"""
+def embed_texts(cfg, texts, timeout=30, mode=None):
+    """批量嵌入。未配置或失败返回 None（调用方应回退到纯词面检索）。
+    mode: "query" 时 sidecar 加检索指令前缀，"doc"/None 不加。"""
     base, key, model = _embedding_endpoint(cfg)
     if not base or not texts:
         return None
     payload = {"model": model, "input": list(texts)}
+    if mode:
+        payload["mode"] = mode
     data, _m, err = _post_sync_raw(base, payload, key, timeout)
     if err:
         return None
@@ -310,7 +334,7 @@ def _post_sync_raw(base, payload, key, timeout=30):
         return None, None, f"embed error: {e}"
 
 
-async def chat_async(cfg, system, user, timeout=90):
+async def chat_async(cfg, system, user, timeout=90, usage_out=None):
     errs = []
     mt = _max_tokens(cfg)
     allow_r = bool(cfg.get("reasoning_fallback"))
@@ -325,13 +349,15 @@ async def chat_async(cfg, system, user, timeout=90):
                              {"role": "user", "content": user}],
                 "temperature": 0.3, "max_tokens": mt}, to)
             text = None if err else _msg_content(data, allow_r)
+            if not err:
+                _acc_usage(usage_out, data)
         if not err and text:
             return text, model
         errs.append(f"{model}: {err or 'empty reply'}")
     return None, (" | ".join(errs) if errs else "未配置 answer_model")
 
 
-async def _post_stream_async(cfg, payload, timeout=90):
+async def _post_stream_async(cfg, payload, timeout=90, usage_out=None):
     """流式 POST：返回 (async_generator, model, err)。generator 产出增量文本。"""
     model, base, key, err = resolve(cfg)
     if err:
@@ -360,6 +386,8 @@ async def _post_stream_async(cfg, payload, timeout=90):
                     chunk = json.loads(data_str)
                 except json.JSONDecodeError:
                     continue
+                if isinstance(chunk.get("usage"), dict):
+                    _acc_usage(usage_out, chunk)
                 choices = chunk.get("choices") or []
                 if not choices:
                     continue
@@ -373,7 +401,7 @@ async def _post_stream_async(cfg, payload, timeout=90):
     return gen(), model, None
 
 
-async def chat_async_stream(cfg, system, user, timeout=90):
+async def chat_async_stream(cfg, system, user, timeout=90, usage_out=None):
     """流式问答：yield 增量文本；末尾通过返回值难以传递 model，
     故用属性挂在 generator 上（实际用法：async for chunk, 最终 model 见函数内 log）。
     返回 (generator, model_used, err)。若整链失败，generator 产出空、err 非空。"""
@@ -388,7 +416,9 @@ async def chat_async_stream(cfg, system, user, timeout=90):
         messages = [{"role": "system", "content": system},
                     {"role": "user", "content": user}]
         gen, _m, err = await _post_stream_async(
-            sub, {"messages": messages, "temperature": 0.3, "max_tokens": mt}, to)
+            sub, {"messages": messages, "temperature": 0.3, "max_tokens": mt,
+                  "stream_options": {"include_usage": True}}, to,
+            usage_out=usage_out)
         if err or gen is None:
             errs.append(f"{model}: {err or 'no stream'}")
             continue
@@ -445,18 +475,19 @@ def _answer_prompt(question, hits, title, fallback):
     return None, None
 
 
-def answer_question(cfg, question, hits, title="", fallback=""):
+def answer_question(cfg, question, hits, title="", fallback="", usage_out=None):
     system, user = _answer_prompt(question, hits, title, fallback)
     if user is None:
         return None, "no excerpts"
-    return chat(cfg, system, user)
+    return chat(cfg, system, user, usage_out=usage_out)
 
 
-async def answer_question_async(cfg, question, hits, title="", fallback=""):
+async def answer_question_async(cfg, question, hits, title="", fallback="",
+                                usage_out=None):
     system, user = _answer_prompt(question, hits, title, fallback)
     if user is None:
         return None, "no excerpts"
-    return await chat_async(cfg, system, user)
+    return await chat_async(cfg, system, user, usage_out=usage_out)
 
 
 LIBRARY_SYS = (
@@ -483,18 +514,21 @@ def build_library_excerpts(question, hits, catalog="", max_hits=8):
     return f"{body}\n\n问题: {question}"
 
 
-async def answer_library_async(cfg, question, hits, catalog="", timeout=90):
+async def answer_library_async(cfg, question, hits, catalog="", timeout=90,
+                               usage_out=None):
     if not hits:
         return None, "no excerpts"
     return await chat_async(cfg, LIBRARY_SYS,
-                            build_library_excerpts(question, hits, catalog), timeout)
+                            build_library_excerpts(question, hits, catalog),
+                            timeout, usage_out=usage_out)
 
 
-def answer_library(cfg, question, hits, catalog="", timeout=90):
+def answer_library(cfg, question, hits, catalog="", timeout=90, usage_out=None):
     if not hits:
         return None, "no excerpts"
     return chat(cfg, LIBRARY_SYS,
-                build_library_excerpts(question, hits, catalog), timeout)
+                build_library_excerpts(question, hits, catalog), timeout,
+                usage_out=usage_out)
 
 
 DEEP_TOOLS = [
@@ -558,7 +592,7 @@ def _deep_run_opencode(cfg, question, title, intro, workdir, timeout=420):
 
 
 async def _deep_openai_async(cfg, question, title, intro, search_fn, read_fn,
-                             max_rounds, timeout):
+                             max_rounds, timeout, usage_out=None):
     user = f"书名: {title}\n"
     if intro:
         user += f"简介: {intro[:300]}\n"
@@ -574,6 +608,7 @@ async def _deep_openai_async(cfg, question, title, intro, search_fn, read_fn,
             "temperature": 0.3, "max_tokens": mt}, timeout)
         if err:
             return None, last_model, err
+        _acc_usage(usage_out, data)
         msg = data["choices"][0]["message"]
         messages.append({k: msg[k] for k in ("role", "content", "tool_calls")
                          if msg.get(k) is not None})
@@ -602,11 +637,13 @@ async def _deep_openai_async(cfg, question, title, intro, search_fn, read_fn,
         "messages": messages, "temperature": 0.3, "max_tokens": mt}, timeout)
     if err:
         return None, last_model, err
+    _acc_usage(usage_out, data)
     return _msg_content(data, allow_r), last_model, None
 
 
 async def deep_answer_async(cfg, question, title="", intro="", search_fn=None,
-                            read_fn=None, max_rounds=6, timeout=45, workdir=None):
+                            read_fn=None, max_rounds=6, timeout=45, workdir=None,
+                            usage_out=None):
     errs = []
     for model in _answer_chain(cfg):
         sub = {**cfg, "answer_model": model}
@@ -622,7 +659,7 @@ async def deep_answer_async(cfg, question, title="", intro="", search_fn=None,
             continue
         text, info, err = await _deep_openai_async(
             sub, question, title, intro, search_fn, read_fn, max_rounds,
-            _model_timeout(cfg, model, timeout))
+            _model_timeout(cfg, model, timeout), usage_out=usage_out)
         if text:
             return text, model
         errs.append(f"{model}: {err or info}")
@@ -630,8 +667,9 @@ async def deep_answer_async(cfg, question, title="", intro="", search_fn=None,
 
 
 def deep_answer(cfg, question, title="", intro="", search_fn=None, read_fn=None,
-                max_rounds=6, timeout=45, workdir=None):
+                max_rounds=6, timeout=45, workdir=None, usage_out=None):
     return asyncio.run(deep_answer_async(
         cfg, question, title=title, intro=intro,
         search_fn=search_fn, read_fn=read_fn,
-        max_rounds=max_rounds, timeout=timeout, workdir=workdir))
+        max_rounds=max_rounds, timeout=timeout, workdir=workdir,
+        usage_out=usage_out))

@@ -784,6 +784,7 @@ async def api_ask(request: Request, body: AskBody):
         return {"hits": hits, "answer": cached, "answer_error": None,
                 "mode": mode, "cached": True}
 
+    usage = {}
     if body.deep:
         try:
             await asyncio.wait_for(DEEP_SEM.acquire(), timeout=8)
@@ -799,7 +800,7 @@ async def api_ask(request: Request, body: AskBody):
                     enrich(_hits_for(body.slug, root, q, 5, 3)),
                     ensure_ascii=False),
                 read_fn=lambda rel: _safe_read(root, rel),
-                workdir=root),
+                workdir=root, usage_out=usage),
                 timeout=DEEP_TOTAL_TIMEOUT)
         except (asyncio.TimeoutError, TimeoutError):
             answer, info = None, (
@@ -815,14 +816,17 @@ async def api_ask(request: Request, body: AskBody):
             fallback = f"{b['intro']}\n\n{fallback}" if fallback else b["intro"]
         t0 = time.time()
         answer, info = await llm.answer_question_async(
-            CFG, body.question, hits, b["title"] or "", fallback)
+            CFG, body.question, hits, b["title"] or "", fallback,
+            usage_out=usage)
     latency_ms = int((time.time() - t0) * 1000)
     model = info if answer else None
     if answer and nq:
         registry.put_cached_answer(c, body.slug, nq, mode, body.question, answer, model=model or "")
     registry.log_interaction(c, user["space_id"], user["display_name"], body.slug,
                              "web", "ask", body.question, len(hits), answer=answer,
-                             model=model, latency_ms=latency_ms)
+                             model=model, latency_ms=latency_ms,
+                             tokens_in=usage.get("tokens_in"),
+                             tokens_out=usage.get("tokens_out"))
     return {"hits": hits, "answer": answer,
             "answer_error": None if answer else info,
             "mode": mode, "cached": False}
@@ -877,10 +881,12 @@ async def api_ask_stream(request: Request, body: AskBody):
     t0 = time.time()
     chunks = []
     model_used = None
+    usage = {}
 
     async def gen_stream():
         nonlocal model_used
-        stream, model, err = await llm.chat_async_stream(CFG, system, user_prompt, 90)
+        stream, model, err = await llm.chat_async_stream(
+            CFG, system, user_prompt, 90, usage_out=usage)
         if err or stream is None:
             yield sse({"type": "error", "error": err or "stream unavailable"})
             return
@@ -899,7 +905,9 @@ async def api_ask_stream(request: Request, body: AskBody):
                                        model=model_used or "")
         registry.log_interaction(c, user["space_id"], user["display_name"], body.slug,
                                  "web", "ask", body.question, len(hits), answer=answer,
-                                 model=model_used, latency_ms=latency_ms)
+                                 model=model_used, latency_ms=latency_ms,
+                                 tokens_in=usage.get("tokens_in"),
+                                 tokens_out=usage.get("tokens_out"))
         yield sse({"type": "done", "hits": hits, "model": model_used,
                    "cached": False, "mode": mode})
 
@@ -953,8 +961,9 @@ async def api_library_ask(request: Request, body: LibraryAskBody):
                 h["chapter_title"] = Path(h.get("path") or "").stem
         catalog = "\n".join(f"- 《{b['title'] or b['slug']}》" for b in books)
         t0 = time.time()
+        usage = {}
         answer, info = await llm.answer_library_async(
-            CFG, q, hits, catalog, 150 if body.deep else 90)
+            CFG, q, hits, catalog, 150 if body.deep else 90, usage_out=usage)
         latency_ms = int((time.time() - t0) * 1000)
         model = info if answer else None
     finally:
@@ -963,7 +972,9 @@ async def api_library_ask(request: Request, body: LibraryAskBody):
     if answer:
         registry.log_interaction(c, user["space_id"], user["display_name"], "",
                                  "web", "ask_library", q, len(hits), answer=answer,
-                                 model=model, latency_ms=latency_ms)
+                                 model=model, latency_ms=latency_ms,
+                                 tokens_in=usage.get("tokens_in"),
+                                 tokens_out=usage.get("tokens_out"))
     return {"hits": hits, "answer": answer,
             "answer_error": None if answer else info,
             "books": [b["slug"] for b in books], "deep": bool(body.deep)}

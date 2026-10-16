@@ -162,6 +162,7 @@ MIGRATIONS = [
     "ALTER TABLE interactions ADD COLUMN latency_ms INTEGER",
     "ALTER TABLE interactions ADD COLUMN tokens_in INTEGER",
     "ALTER TABLE interactions ADD COLUMN tokens_out INTEGER",
+    "ALTER TABLE index_embed ADD COLUMN updated_at BIGINT",
 ]
 
 
@@ -1424,36 +1425,91 @@ def _cosine(a, b):
     return dot / (na * nb)
 
 
+def _embed_db_path(cfg):
+    """本地向量库路径。向量是派生数据：每台机器各存一份 embed.db（float32 BLOB），
+    避免跨机拉取 PG 中 index_embed（~100MB，低速链路下冷加载需 15 分钟+）。"""
+    v = str((cfg or {}).get("embed_db") or "pipeline/embed.db")
+    if v.startswith(("postgres://", "postgresql://")):
+        return None
+    p = Path(v)
+    return p if p.is_absolute() else Path(__file__).parent.parent / p
+
+
+_EMBED_SCHEMA = """CREATE TABLE IF NOT EXISTS index_embed(
+  book_slug TEXT NOT NULL,
+  path TEXT NOT NULL,
+  line INTEGER NOT NULL,
+  model TEXT,
+  dim INTEGER,
+  vec TEXT,
+  PRIMARY KEY(book_slug, path, line)
+)"""
+
+
+def _embed_con(cfg):
+    """打开本地向量库（每次新建连接；sqlite WAL 支持并发读写）。失败返回 None。"""
+    p = _embed_db_path(cfg)
+    if p is None:
+        return None
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        con = sqlite3.connect(str(p), timeout=10)
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA busy_timeout=5000")
+        con.execute(_EMBED_SCHEMA)
+        cols = {r[1] for r in con.execute("PRAGMA table_info(index_embed)")}
+        if "updated_at" not in cols:
+            con.execute("ALTER TABLE index_embed ADD COLUMN updated_at BIGINT")
+            con.commit()
+        return con
+    except Exception:
+        return None
+
+
 def embed_book(con, slug, cfg, batch=64):
-    """为某书全部已索引行生成嵌入并写入 index_embed。返回嵌入行数。"""
+    """为某书全部已索引行生成嵌入并写入**本地** embed.db。返回嵌入行数。
+    index_lines 从 con（PG/共享）读，向量写本地：WAN 只承载文本。"""
+    import struct
+
     import llm
     base, key, model = llm._embedding_endpoint(cfg)
     if not base:
         return 0
-    rows = con.execute(
-        "SELECT path, line, text FROM index_lines WHERE book_slug=?",
-        (slug,)).fetchall()
-    if not rows:
+    econ = _embed_con(cfg)
+    if econ is None:
         return 0
-    items = [(r["path"], r["line"], r["text"]) for r in rows]
-    written = 0
-    for i in range(0, len(items), batch):
-        chunk = items[i:i + batch]
-        vecs = llm.embed_texts(cfg, [t for _, _, t in chunk], timeout=60)
-        if not vecs:
-            continue
-        dim = len(vecs[0])
-        pairs = [(slug, p, ln, model, dim, json.dumps(v))
-                 for (p, ln, _), v in zip(chunk, vecs)]
-        _embed_write(con, pairs)
-        written += len(pairs)
-    return written
+    try:
+        rows = con.execute(
+            "SELECT path, line, text FROM index_lines WHERE book_slug=?",
+            (slug,)).fetchall()
+        if not rows:
+            return 0
+        items = [(r["path"], r["line"], r["text"]) for r in rows]
+        written = 0
+        for i in range(0, len(items), batch):
+            chunk = items[i:i + batch]
+            vecs = llm.embed_texts(cfg, [t for _, _, t in chunk], timeout=60,
+                                   mode="doc")
+            if not vecs:
+                continue
+            dim = len(vecs[0])
+            now = int(time.time())
+            pairs = [(slug, p, ln, model, dim,
+                      struct.pack(f"<{len(v)}f", *v), now)
+                     for (p, ln, _), v in zip(chunk, vecs)]
+            _embed_write(econ, pairs)
+            written += len(pairs)
+        return written
+    finally:
+        econ.close()
 
 
 def _embed_write(con, pairs):
-    ins = ("INSERT INTO index_embed(book_slug,path,line,model,dim,vec)"
-           " VALUES(?,?,?,?,?,?) ON CONFLICT(book_slug,path,line)"
-           " DO UPDATE SET model=excluded.model, dim=excluded.dim, vec=excluded.vec")
+    ins = ("INSERT INTO index_embed(book_slug,path,line,model,dim,vec,updated_at)"
+           " VALUES(?,?,?,?,?,?,?) ON CONFLICT(book_slug,path,line)"
+           " DO UPDATE SET model=excluded.model, dim=excluded.dim,"
+           " vec=excluded.vec, updated_at=excluded.updated_at")
     if _pg(con):
         with con.transaction():
             con.executemany(ins, pairs)
@@ -1462,19 +1518,131 @@ def _embed_write(con, pairs):
     con.commit()
 
 
-def _vector_search(con, slugs, query_vec, top_files=20, max_lines=3, cfg=None):
-    """在 index_embed 上做余弦近邻检索，按文件聚合。结果结构与 _index_terms 相同。"""
+try:
+    import numpy as _np
+except ImportError:  # 无 numpy（如本地未装 fastembed）时回退纯 Python
+    _np = None
+
+_VEC_CACHE = {}
+_VEC_CACHE_LOCK = threading.Lock()
+
+
+def _embed_fingerprint(con, slugs):
+    """向量缓存指纹：行数 + 模型 + 最近写入时间（--embed 重跑即失效）。"""
+    ph = ",".join("?" * len(slugs))
+    r = con.execute(
+        f"SELECT COUNT(*) AS n, MAX(model) AS m, MAX(updated_at) AS u"
+        f" FROM index_embed WHERE book_slug IN ({ph})", list(slugs)).fetchone()
+    return (r["n"], r["m"], r["u"])
+
+
+def _vec_cache_load(con, slugs):
+    """加载本地向量库并构建 numpy 矩阵（BLOB float32 零解析；兼容旧 TEXT json）。
+    无 numpy 或异常返回 None。"""
+    if _np is None:
+        return None
     ph = ",".join("?" * len(slugs))
     rows = con.execute(
         f"SELECT book_slug, path, line, vec FROM index_embed"
         f" WHERE book_slug IN ({ph})", list(slugs)).fetchall()
-    if not rows:
-        return []
+    keys, lines, vec_rows = [], [], []
+    for r in rows:
+        raw = r["vec"]
+        if isinstance(raw, (bytes, bytearray, memoryview)):
+            arr = _np.frombuffer(raw, dtype=_np.float32)
+        else:
+            try:
+                arr = _np.asarray(json.loads(raw), dtype=_np.float32)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+        if arr.size == 0:
+            continue
+        keys.append((r["book_slug"], r["path"]))
+        lines.append(r["line"])
+        vec_rows.append(arr)
+    if not vec_rows:
+        return {"keys": [], "lines": [], "mat": None, "norms": None, "dim": 0}
+    try:
+        mat = _np.vstack(vec_rows)
+    except ValueError:  # 维度不一致
+        return None
+    return {"keys": keys, "lines": lines, "mat": mat,
+            "norms": _np.linalg.norm(mat, axis=1), "dim": int(mat.shape[1])}
+
+
+def _vec_cache_get(con, slugs, key, dim):
+    """带指纹校验的进程内向量缓存；count/model/updated_at 变化即重载。
+    无 numpy 或加载失败返回 None（调用方走纯 Python 路径）。"""
+    if _np is None:
+        return None
+    try:
+        fp = _embed_fingerprint(con, slugs)
+    except Exception:
+        return None
+    with _VEC_CACHE_LOCK:
+        ent = _VEC_CACHE.get(key)
+    if ent and ent.get("fp") == fp and ent.get("dim") in (0, dim):
+        return ent
+    try:
+        ent = _vec_cache_load(con, slugs)
+    except Exception:
+        return None
+    if ent is None or (ent["mat"] is not None and ent["dim"] != dim):
+        return None
+    ent["fp"] = fp
+    with _VEC_CACHE_LOCK:
+        if len(_VEC_CACHE) > 32:
+            _VEC_CACHE.clear()
+        _VEC_CACHE[key] = ent
+    return ent
+
+
+def _agg_files(con, agg, top_files, max_lines):
+    """聚合 (book_slug,path) -> 文件级结果（含 top 行片段），结构同 _index_terms。
+    片段用行值 IN 一次性批量取（跨机 RTT 高，避免每文件一查）。"""
+    plans = []
+    wanted = []
+    for (bs, path), v in agg.items():
+        line_nos = sorted(v["lines"], key=lambda n: -v["lines"][n][0])[:max_lines]
+        plans.append(((bs, path), line_nos))
+        wanted.extend((bs, path, n) for n in line_nos)
+    snippets = {}
+    for i in range(0, len(wanted), 200):
+        chunk = wanted[i:i + 200]
+        ph = ",".join("(?,?,?)" for _ in chunk)
+        args = [x for t in chunk for x in t]
+        for lr in con.execute(
+                f"SELECT book_slug, path, line, text FROM index_lines"
+                f" WHERE (book_slug,path,line) IN ({ph})", args):
+            snippets[(lr["book_slug"], lr["path"], lr["line"])] = \
+                lr["text"][:180]
+    out = []
+    for (bs, path), line_nos in plans:
+        lines = [{"line": n, "snippet": snippets.get((bs, path, n), "")}
+                 for n in line_nos]
+        out.append({"book_slug": bs, "path": path, "score": agg[(bs, path)]["score"],
+                    "lines": lines, "tokens": 0})
+    out.sort(key=lambda x: (-x["score"], x["book_slug"], x["path"]))
+    return out[:top_files]
+
+
+def _vector_search_slow(econ, con, slugs, query_vec, top_files, max_lines):
+    ph = ",".join("?" * len(slugs))
+    rows = econ.execute(
+        f"SELECT book_slug, path, line, vec FROM index_embed"
+        f" WHERE book_slug IN ({ph})", list(slugs)).fetchall()
     agg = {}
     for r in rows:
-        try:
-            v = json.loads(r["vec"])
-        except (json.JSONDecodeError, TypeError):
+        raw = r["vec"]
+        if isinstance(raw, (bytes, bytearray, memoryview)):
+            import struct
+            v = list(struct.unpack(f"<{len(raw) // 4}f", bytes(raw)))
+        else:
+            try:
+                v = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                continue
+        if not isinstance(v, list) or len(v) != len(query_vec):
             continue
         score = _cosine(query_vec, v)
         if score <= 0:
@@ -1485,23 +1653,44 @@ def _vector_search(con, slugs, query_vec, top_files=20, max_lines=3, cfg=None):
             a = agg[key] = {"score": 0, "lines": {}}
         a["score"] += score
         a["lines"].setdefault(r["line"], (score, None))
-    # 取每文件 top 行片段（从 index_lines 补 snippet）
-    out = []
-    for (bs, path), v in agg.items():
-        line_nos = sorted(v["lines"], key=lambda n: -v["lines"][n][0])[:max_lines]
-        snippets = {}
-        if line_nos:
-            lph = ",".join("?" * len(line_nos))
-            for lr in con.execute(
-                    f"SELECT line, text FROM index_lines"
-                    f" WHERE book_slug=? AND path=? AND line IN ({lph})",
-                    [bs, path] + line_nos):
-                snippets[lr["line"]] = lr["text"][:180]
-        lines = [{"line": n, "snippet": snippets.get(n, "")} for n in line_nos]
-        out.append({"book_slug": bs, "path": path, "score": v["score"],
-                    "lines": lines, "tokens": 0})
-    out.sort(key=lambda x: (-x["score"], x["book_slug"], x["path"]))
-    return out[:top_files]
+    return _agg_files(con, agg, top_files, max_lines)
+
+
+def _vector_search(con, slugs, query_vec, top_files=20, max_lines=3, cfg=None):
+    """在**本地** embed.db 上做余弦近邻检索，按文件聚合。结果结构与 _index_terms
+    相同。有 numpy 时矩阵+进程内缓存（ms 级），否则逐行纯 Python。
+    片段仍从 con 的 index_lines 补（小流量）。"""
+    if not query_vec:
+        return []
+    econ = _embed_con(cfg)
+    if econ is None:
+        return []
+    try:
+        key = (str(_embed_db_path(cfg)),) + tuple(sorted(slugs))
+        entry = _vec_cache_get(econ, slugs, key, len(query_vec))
+        if entry is None:
+            return _vector_search_slow(econ, con, slugs, query_vec,
+                                       top_files, max_lines)
+        if entry["mat"] is None:
+            return []
+        q = _np.asarray(query_vec, dtype=_np.float32)
+        qn = float(_np.linalg.norm(q))
+        if not qn:
+            return []
+        scores = (entry["mat"] @ q) / (entry["norms"] * qn + 1e-12)
+        agg = {}
+        for i, score in enumerate(scores.tolist()):
+            if score <= 0:
+                continue
+            key2 = entry["keys"][i]
+            a = agg.get(key2)
+            if a is None:
+                a = agg[key2] = {"score": 0, "lines": {}}
+            a["score"] += score
+            a["lines"].setdefault(entry["lines"][i], (score, None))
+        return _agg_files(con, agg, top_files, max_lines)
+    finally:
+        econ.close()
 
 
 def _rrf_fuse(lexical, vector, k=60):
@@ -1546,14 +1735,15 @@ def search_index_hybrid(con, slugs, query, cfg, limit_files=6, max_lines=3,
     if not base:
         return lexical
     try:
-        qvec = llm.embed_texts(cfg, [query], timeout=20)
+        qvec = llm.embed_texts(cfg, [query], timeout=20, mode="query")
     except Exception:
         qvec = None
     if not qvec or not qvec[0]:
         return lexical
     try:
         vector = _vector_search(con, slugs, qvec[0],
-                                top_files=limit_files * 2, max_lines=max_lines)
+                                top_files=limit_files * 2, max_lines=max_lines,
+                                cfg=cfg)
     except Exception:
         vector = []
     if not vector:
@@ -1566,7 +1756,9 @@ def search_index_hybrid(con, slugs, query, cfg, limit_files=6, max_lines=3,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db", default=str(Path(__file__).parent / "registry.db"))
+    ap.add_argument("--db", default=None,
+                    help="db 路径或 postgres URL；缺省取 config.registry_db"
+                         "（相对路径按仓库根解析），再缺省 pipeline/registry.db")
     ap.add_argument("--init", action="store_true")
     ap.add_argument("--seed", action="store_true")
     ap.add_argument("--sources", default="H:/book")
@@ -1577,7 +1769,17 @@ def main():
                     help="生成行级嵌入(需配置 embedding_model)：留空=全部；或 slug 列表")
     ap.add_argument("--config", default=str(Path(__file__).parent / "config.json"))
     a = ap.parse_args()
-    con = connect(a.db)
+    try:
+        cfg = json.loads(Path(a.config).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        cfg = {}
+    if a.db:
+        db = a.db
+    elif cfg.get("registry_db"):
+        db = resolve_db(cfg["registry_db"], Path(__file__).parent.parent)
+    else:
+        db = Path(__file__).parent / "registry.db"
+    con = connect(db)
     if a.init:
         print("initialized:", a.db)
     if a.seed:
@@ -1585,10 +1787,6 @@ def main():
         m = link_sources(con, a.sources)
         print(f"imported {n} skills, linked {m} sources")
     if a.embed is not None:
-        try:
-            cfg = json.loads(Path(a.config).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            cfg = {}
         want = {s.strip() for s in a.embed.split(",") if s.strip()}
         rows = con.execute("SELECT slug FROM books").fetchall()
         total = 0
