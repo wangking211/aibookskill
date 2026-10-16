@@ -1,0 +1,222 @@
+{
+  "version": 1,
+  "note": "A2 召回标注集：30 条换说法问句，刻意避开原文关键词以拉开词面/混合差距。gold.path 与服务器 index_lines.path 一致。",
+  "items": [
+    {
+      "id": "mcp-01",
+      "book": "ai-agents-with-mcp",
+      "question": "客户端怎么知道服务器还在不在，掉线了会怎样？",
+      "gold": [
+        {"path": "chapters/ch06-resources.md", "line": 24},
+        {"path": "chapters/ch04-connecting-to-servers.md", "line": 82}
+      ],
+      "note": "Connection guard / RuntimeError；语义亦贴连接建立章"
+    },
+    {
+      "id": "mcp-02",
+      "book": "ai-agents-with-mcp",
+      "question": "服务端想发布一些现成的交互模板而不是数据或动作，该用哪个原语？",
+      "gold": [{"path": "chapters/ch07-prompts.md", "line": 8}],
+      "note": "prompts = ready-made interaction patterns"
+    },
+    {
+      "id": "mcp-03",
+      "book": "ai-agents-with-mcp",
+      "question": "ping 在 MCP 里是干什么用的？",
+      "gold": [{"path": "chapters/ch08-going-deeper-client-capabilities.md", "line": 25}],
+      "note": "send_ping 健康检查"
+    },
+    {
+      "id": "mcp-04",
+      "book": "ai-agents-with-mcp",
+      "question": "工具描述写得不好的话模型会选错工具吗，发现了怎么修？",
+      "gold": [{"path": "cheatsheet.md", "line": 56}],
+      "note": "wrong tool → overlapping descriptions, fix vocabulary"
+    },
+    {
+      "id": "mcp-05",
+      "book": "ai-agents-with-mcp",
+      "question": "给每个模型和每个工具都单独写一个连接器会有什么后果？",
+      "gold": [{"path": "chapters_zh/ch01-agentic-ai-and-mcp.md", "line": 106}],
+      "note": "M×N 问题"
+    },
+    {
+      "id": "be-01",
+      "book": "behavioral-economics",
+      "question": "为什么说行为经济学文献里的证据不对称，支持性的多、能推翻的少？",
+      "gold": [{"path": "chapters/ch18-anomalies.md", "line": 34}],
+      "note": "沃森四卡专栏：2 卡多于 3/B 卡"
+    },
+    {
+      "id": "be-02",
+      "book": "behavioral-economics",
+      "question": "滑雪场为什么对本地人和外地游客收不一样的钱？",
+      "gold": [{"path": "chapters/ch13-ski-resort.md", "line": 18}],
+      "note": "客户分层定价"
+    },
+    {
+      "id": "be-03",
+      "book": "behavioral-economics",
+      "question": "评估一条规范是不是真的存在，应该先看什么？",
+      "gold": [{"path": "chapters/ch15-fairness-games.md", "line": 23}],
+      "note": "谁出钱执法分层"
+    },
+    {
+      "id": "be-04",
+      "book": "behavioral-economics",
+      "question": "一个助推要想合格，需要通过哪几条自检？",
+      "gold": [{"path": "chapters/ch32-libertarian-paternalism.md", "line": 27}],
+      "note": "三步自检：谁的目标/退出成本/错误可预测"
+    },
+    {
+      "id": "cp-01",
+      "book": "computer-principles",
+      "question": "从输入网址到看到网页，中间都经过了哪些步骤？",
+      "gold": [{"path": "cheatsheet.md", "line": 62}],
+      "note": "DNS→TCP→HTTP→渲染 全链路"
+    },
+    {
+      "id": "cp-02",
+      "book": "computer-principles",
+      "question": "屏幕成像方式的更迭主线是什么，每一代解决了什么问题？",
+      "gold": [{"path": "chapters/ch02-software.md", "line": 51}],
+      "note": "CRT→LCD→OLED"
+    },
+    {
+      "id": "cp-03",
+      "book": "computer-principles",
+      "question": "内存不够用的时候操作系统靠什么机制撑住的？",
+      "gold": [{"path": "patterns.md", "line": 25}],
+      "note": "分页/缺页中断/pagefile"
+    },
+    {
+      "id": "cp-04",
+      "book": "computer-principles",
+      "question": "云计算、大数据、AI 这些时髦应用的本质是什么？",
+      "gold": [{"path": "chapters/ch05-applications.md", "line": 4}],
+      "note": "无外乎计算、存储、传输"
+    },
+    {
+      "id": "ef-01",
+      "book": "english-framework",
+      "question": "非谓语的五种形式各自对应什么时态和语态状态？",
+      "gold": [{"path": "chapters/ch03-non-verb.md", "line": 10}],
+      "note": "五层楼对照"
+    },
+    {
+      "id": "ef-02",
+      "book": "english-framework",
+      "question": "一句话里出现了好几个动词，第一步该怎么处理？",
+      "gold": [{"path": "cheatsheet.md", "line": 16}],
+      "note": "数动词定理二"
+    },
+    {
+      "id": "ef-03",
+      "book": "english-framework",
+      "question": "为什么 I feel interested 用 interested，而 The movie is interesting 用 interesting？",
+      "gold": [{"path": "chapters/ch02-basic-concepts.md", "line": 12}],
+      "note": "及物两条件"
+    },
+    {
+      "id": "ef-04",
+      "book": "english-framework",
+      "question": "what 和 how 后面接不定式时用法有什么区别？",
+      "gold": [{"path": "chapters/ch05-pronunciation-memory.md", "line": 19}],
+      "note": "what to do vs how to do it"
+    },
+    {
+      "id": "lt-01",
+      "book": "life-truth",
+      "question": "怎么判断一件事是不是真实发生的，判断标准是什么？",
+      "gold": [{"path": "cheatsheet.md", "line": 4}],
+      "note": "过去=记忆、未来=想象"
+    },
+    {
+      "id": "lt-02",
+      "book": "life-truth",
+      "question": "作者用城市和蚂蚁打比方，想说明自由意志的什么特点？",
+      "gold": [{"path": "chapters/ch05-beyond-mind.md", "line": 25}],
+      "note": "蚂蚁与城市"
+    },
+    {
+      "id": "lt-03",
+      "book": "life-truth",
+      "question": "为什么作者说还在幻想世界里的人当不了真正的疗愈者？",
+      "gold": [{"path": "chapters/ch03-healing-essence.md", "line": 22}],
+      "note": "打铁还需自身体"
+    },
+    {
+      "id": "ph-01",
+      "book": "positive-health",
+      "question": "全球每年因慢性病死亡的人数和占比是多少？",
+      "gold": [{"path": "chapters_zh/ch01-introduction.md", "line": 60}],
+      "note": "4100 万 / 71%"
+    },
+    {
+      "id": "ph-02",
+      "book": "positive-health",
+      "question": "宽恕别人这件事，最终最大的受益人是谁？",
+      "gold": [{"path": "chapters_bi/ch07-relationship-tools.md", "line": 67}],
+      "note": "宽恕是为了宽恕者自己"
+    },
+    {
+      "id": "ph-03",
+      "book": "positive-health",
+      "question": "面对中等程度的压力，用什么心态应对反而能提升动力？",
+      "gold": [{"path": "chapters_bi/ch03-energising-tools.md", "line": 69}],
+      "note": "moderate stress as challenge not threat"
+    },
+    {
+      "id": "ph-04",
+      "book": "positive-health",
+      "question": "GROW 模型里的每个字母代表什么，最后落到什么上？",
+      "gold": [{"path": "chapters/ch10-going-with-the-waves-of-change.md", "line": 17}],
+      "note": "Goal→Reality→Options→Will→Tactics→Habit"
+    },
+    {
+      "id": "ft-01",
+      "book": "100-free-online-tools-to-get-things-done-quicker",
+      "question": "电脑变慢的时候人们总爱怪罪广告，真正常见的原因是什么？",
+      "gold": [{"path": "chapters_zh/ch07-ad-blocking.md", "line": 87}],
+      "note": "标签页开太多"
+    },
+    {
+      "id": "ft-02",
+      "book": "100-free-online-tools-to-get-things-done-quicker",
+      "question": "有没有办法自动记录邮件有没有被打开、对方点没点链接？",
+      "gold": [{"path": "chapters_zh/ch02-gmail-email-management.md", "line": 67}],
+      "note": "Auto-logging opens/clicks"
+    },
+    {
+      "id": "ft-03",
+      "book": "100-free-online-tools-to-get-things-done-quicker",
+      "question": "番茄工作法的具体节奏是怎么安排的？",
+      "gold": [
+        {"path": "chapters/ch12-focus-time-wasters.md", "line": 9},
+        {"path": "chapters_zh/ch12-focus-time-wasters.md", "line": 10}
+      ],
+      "note": "25/5 ×4 后长休；中文问句合理召回译文章"
+    },
+    {
+      "id": "is-01",
+      "book": "interactive-storytelling-across-media-approach-to-writing-producing-and-editing-with-ai",
+      "question": "BDI 这个缩写展开是什么，出自谁的理论？",
+      "gold": [{"path": "glossary.md", "line": 13}],
+      "note": "Belief-Desire-Intention / Bratman"
+    },
+    {
+      "id": "is-02",
+      "book": "interactive-storytelling-across-media-approach-to-writing-producing-and-editing-with-ai",
+      "question": "生成式故事系统里，用户的分支选择和河流小船的比喻有什么关系？",
+      "gold": [{"path": "chapters_zh/ch01-introduction.md", "line": 110}],
+      "note": "boat-on-the-river model"
+    },
+    {
+      "id": "is-03",
+      "book": "interactive-storytelling-across-media-approach-to-writing-producing-and-editing-with-ai",
+      "question": "只让大模型轮流写句子、不加结构控制，会出什么问题？",
+      "gold": [{"path": "chapters_zh/ch05-engines-and-systems.md", "line": 135}],
+      "note": "不连贯的共创 → 叙事断裂"
+    }
+  ]
+}
