@@ -275,6 +275,15 @@ tbody tr:hover { background: #f8f9fb; }
 }
 .line.cite-link { cursor: pointer; }
 .line.cite-link:hover { color: var(--accent); }
+.chat-bar { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
+.chat-bar select { flex: 1; max-width: 320px; }
+.chat-msg { margin: 10px 0; padding: 10px 12px; border-radius: var(--radius); }
+.chat-msg.user { background: #eef2f7; }
+.chat-msg.user .chat-text { white-space: pre-wrap; }
+.chat-msg.assistant { background: var(--card); border: 1px solid var(--line); }
+.chat-msg .chat-src { color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+.chat-hits { margin-top: 8px; border-top: 1px dashed var(--line); padding-top: 6px; }
+.chat-hits .hit { border: none; background: none; padding: 4px 0; }
 .stat-summary {
   display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;
   margin-bottom: 14px;

@@ -95,11 +95,29 @@ journalctl -u aibook-worker -f
 
 ### 索引异常
 ```bash
-# 回填全部索引
+# 回填全部索引（词面 index_lines，PG）
 python pipeline/registry.py --reindex
 # 单书重建（在 python 里）
 import registry; registry.reindex_book(con, slug, skills_home)
 ```
+
+### 向量索引（embed.db）— 每机本地
+向量存 **每机本地** `pipeline/embed.db`（sqlite float32 BLOB，~51MB/机），不走 PG
+（m1↔m3 冷加载 15-30 分钟，不可接受）。PG `index_embed` 表弃用留作备份。
+
+```bash
+# 每台机器（m1/m2）各自回填 —— 书重索引或换 embedding 模型后必做
+cd /opt/aibook/app
+/opt/aibook/venv/bin/python pipeline/embed_service.py --embed
+# 确认行数（应一致，当前 12274）
+/opt/aibook/venv/bin/python -c "
+import sqlite3; con=sqlite3.connect('pipeline/embed.db')
+print(con.execute('SELECT COUNT(*) FROM embeds').fetchone()[0])"
+```
+
+- 缓存指纹 `(count, model, updated_at)` 变化时自动重载，**无需重启**服务
+- sidecar `aibook-embed.service` 端口 8799，`/health` 应 200
+- 只跑 `--embed` 的那台机器会更新；另一台需单独执行（无自动同步）
 
 ### /tmp 遮蔽标准库
 若 `/tmp` 有 `inspect.py` 等与 stdlib 同名的 `.py`，从 `/tmp` 跑任何 `import inspect` 的脚本都会崩。处理：`mv /tmp/*.py /opt/aibook/ops/debug-scripts/`。
@@ -119,6 +137,9 @@ curl -s -o /dev/null -w "%{http_code}" https://aibook.zxixing.com/
 curl -s -o /dev/null -w "%{http_code}" https://aibook.zxixing.com/api/books
 curl -s -o /dev/null -w "%{http_code}" https://aibook.zxixing.com/api/faq
 curl -s -o /dev/null -w "%{http_code}" https://aibook.zxixing.com/static/aibook-kit.zip
+# chat 需登录，匿名应 401（验证路由已注册）
+curl -s -o /dev/null -w "%{http_code}" -X POST https://aibook.zxixing.com/api/chat \
+  -H 'Content-Type: application/json' -d '{"question":"x"}'
 
 # 3. mindos（红线）
 curl -s -o /dev/null -w "%{http_code}" https://mindos.zxixing.com/health

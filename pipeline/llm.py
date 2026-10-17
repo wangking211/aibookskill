@@ -401,20 +401,23 @@ async def _post_stream_async(cfg, payload, timeout=90, usage_out=None):
     return gen(), model, None
 
 
-async def chat_async_stream(cfg, system, user, timeout=90, usage_out=None):
+async def chat_async_stream(cfg, system, user, timeout=90, usage_out=None,
+                            messages=None):
     """流式问答：yield 增量文本；末尾通过返回值难以传递 model，
     故用属性挂在 generator 上（实际用法：async for chunk, 最终 model 见函数内 log）。
-    返回 (generator, model_used, err)。若整链失败，generator 产出空、err 非空。"""
+    返回 (generator, model_used, err)。若整链失败，generator 产出空、err 非空。
+    messages: 可选完整对话数组（多轮场景）；提供时忽略 system/user。"""
     errs = []
     mt = _max_tokens(cfg)
     allow_r = bool(cfg.get("reasoning_fallback"))
+    if not messages:
+        messages = [{"role": "system", "content": system},
+                    {"role": "user", "content": user}]
     for model in _answer_chain(cfg):
         sub = {**cfg, "answer_model": model}
         to = _model_timeout(cfg, model, timeout)
         if _is_opencode_model(sub):
             continue  # opencode serve 不支持流式，跳过
-        messages = [{"role": "system", "content": system},
-                    {"role": "user", "content": user}]
         gen, _m, err = await _post_stream_async(
             sub, {"messages": messages, "temperature": 0.3, "max_tokens": mt,
                   "stream_options": {"include_usage": True}}, to,
@@ -473,6 +476,31 @@ def _answer_prompt(question, hits, title, fallback):
         return ANSWER_SYS, (f"书名: {title}\n\n书的概览(SKILL):\n{fallback[:3000]}\n\n"
                             f"问题: {question}")
     return None, None
+
+
+CHAT_SYS = (
+    "你是读书助手，回答用中文、简洁准确。你在与用户进行连续多轮对话："
+    "结合之前的对话上下文理解指代与追问（如'第二点展开讲讲'），"
+    "优先基于本次提供的书摘作答；用户指代前文而本次无新材料时，"
+    "基于对话上下文回答即可。回答末尾用一行列出引用的章节：【引用:章节名】。"
+)
+
+CHAT_HISTORY_MAX = 12
+CHAT_TURN_CHARS = 1500
+
+
+def build_chat_messages(question, hits, title="", history=None):
+    """多轮对话消息数组：system + 最近历史 + 当前题（含实时检索书摘）。"""
+    msgs = [{"role": "system", "content": CHAT_SYS}]
+    for m in (history or [])[-CHAT_HISTORY_MAX:]:
+        role = m.get("role")
+        content = (m.get("content") or "")[:CHAT_TURN_CHARS]
+        if role in ("user", "assistant") and content:
+            msgs.append({"role": role, "content": content})
+    user = build_excerpts(question, hits, title) if hits else \
+        (f"书名: {title}\n\n" if title else "") + f"问题: {question}"
+    msgs.append({"role": "user", "content": user})
+    return msgs
 
 
 def answer_question(cfg, question, hits, title="", fallback="", usage_out=None):

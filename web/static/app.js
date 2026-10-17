@@ -444,6 +444,11 @@ async function openBook(slug) {
       <li data-no="${c.no}"><span class="no">ch${String(c.no).padStart(2, "0")}</span>
       <span>${esc(c.title)}</span></li>`).join("");
     $("#d-chapters").dataset.slug = slug;
+    chatState.slug = slug;
+    chatState.sessionId = null;
+    $("#d-hits").innerHTML = "";
+    $("#d-sessions").value = "";
+    loadChatSessions($("#d-sessions"), slug);
     loadBookQA(slug);
   } catch (e) { toast("打开失败: " + e.message); }
 }
@@ -522,15 +527,19 @@ $("#d-chapters").addEventListener("click", (e) => {
   readState.lang = b.dataset.lang;
   loadChapter();
 });
-async function streamAsk(slug, question, onToken) {
-  const resp = await fetch("/api/ask/stream", {
+// ---- 会话式问答（/api/chat SSE） ----
+const chatState = { slug: "", sessionId: null };
+const libChatState = { sessionId: null };
+
+async function streamChat(payload, onToken) {
+  const resp = await fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ slug, question, deep: false }),
+    body: JSON.stringify(payload),
   });
   if (!resp.ok || !resp.body) {
     const err = await resp.json().catch(() => ({}));
-    throw new Error(err.error || ("HTTP " + resp.status));
+    throw new Error(err.error || err.detail || ("HTTP " + resp.status));
   }
   const reader = resp.body.getReader();
   const dec = new TextDecoder();
@@ -555,7 +564,40 @@ async function streamAsk(slug, question, onToken) {
   return done;
 }
 
-$("#d-ask").addEventListener("click", async () => {
+function chatHitsHtml(hits, slug) {
+  if (!hits || !hits.length) return "";
+  return `<div class="chat-hits">` + hits.map((h) => `
+    <div class="hit">
+      <div class="src">${h.book_title ? "《" + esc(h.book_title) + "》· " : ""}${esc(h.chapter_title || h.path)} · ${h.lines.length} 处匹配</div>
+      ${h.lines.map((l) => `<div class="line cite-link" data-slug="${esc(h.book_slug || slug)}"`
+        + ` data-ch="${h.chapter_no != null ? h.chapter_no : ""}" data-snip="${esc(l.snippet)}">`
+        + `${esc(l.snippet)}</div>`).join("")}
+    </div>`).join("") + `</div>`;
+}
+
+function renderChatMsgs(box, msgs, defaultSlug) {
+  box.innerHTML = (msgs || []).map((m) => {
+    if (m.role === "user")
+      return `<div class="chat-msg user"><div class="chat-text">${esc(m.content)}</div></div>`;
+    const html = linkifyCitations(renderMd(m.content), m.hits || [], defaultSlug);
+    return `<div class="chat-msg assistant answer-block"><div class="chat-src">AI 回答</div>`
+      + `<div class="line md-body">${html}</div>${chatHitsHtml(m.hits, defaultSlug)}</div>`;
+  }).join("");
+  box.scrollTop = box.scrollHeight;
+}
+
+async function loadChatSessions(sel, slug) {
+  try {
+    const rows = await jget("/api/chat/sessions?slug=" + encodeURIComponent(slug));
+    sel.innerHTML = '<option value="">当前对话</option>' + rows.map((s) =>
+      `<option value="${esc(s.id)}">${esc(s.title || "会话")} · ${fmtTime(s.updated_at)}</option>`).join("");
+  } catch (e) { /* 未登录：保持只有“当前对话” */ }
+}
+
+let bookAskBusy = false;
+async function askBookChat() {
+  if (bookAskBusy) return;
+  bookAskBusy = true;
   const slug = $("#d-chapters").dataset.slug;
   const question = $("#d-question").value.trim();
   if (!question) return toast("先输入问题");
@@ -563,52 +605,89 @@ $("#d-ask").addEventListener("click", async () => {
   const btn = $("#d-ask");
   btn.textContent = deep ? "深度思考中…" : "回答中…";
   btn.classList.add("busy");
+  const box = $("#d-hits");
   try {
-    let r;
-    if (!deep) {
-      $("#d-hits").innerHTML = '<div class="hit answer-block"><div class="src">AI 回答 · 流式</div><div class="line md-body" id="stream-body"></div></div>';
-      const bodyEl = $("#stream-body");
-      const chunks = [];
-      try {
-        r = await streamAsk(slug, question, (tok) => {
-          chunks.push(tok);
-          bodyEl.textContent = chunks.join("");
-        });
-        r.answer = chunks.join("");
-        r.hits = r.hits || [];
-        bodyEl.innerHTML = linkifyCitations(renderMd(r.answer), r.hits, slug);
-      } catch (se) {
-        r = await jpost("/api/ask", { slug, question, deep: false });
-      }
+    box.insertAdjacentHTML("beforeend",
+      `<div class="chat-msg user"><div class="chat-text">${esc(question)}</div></div>`);
+    if (deep) {
+      const r = await jpost("/api/ask", { slug, question, deep: true });
+      box.insertAdjacentHTML("beforeend",
+        `<div class="chat-msg assistant answer-block"><div class="chat-src">AI 回答 · 深度模式</div>`
+        + `<div class="line md-body">${linkifyCitations(renderMd(r.answer || ""), r.hits || [], slug)}</div>`
+        + chatHitsHtml(r.hits, slug) + `</div>`);
     } else {
-      r = await jpost("/api/ask", { slug, question, deep });
+      box.insertAdjacentHTML("beforeend",
+        `<div class="chat-msg assistant answer-block">`
+        + `<div class="chat-src">AI 回答 · 流式</div>`
+        + `<div class="line md-body" id="stream-body"></div>`
+        + `<div class="chat-hits" id="stream-hits" hidden></div></div>`);
+      const bubble = box.lastElementChild;
+      const bodyEl = bubble.querySelector("#stream-body");
+      const hitsEl = bubble.querySelector("#stream-hits");
+      const chunks = [];
+      let r = null;
+      try {
+        r = await streamChat({ slug, question, session_id: chatState.sessionId || "" },
+          (tok) => { chunks.push(tok); bodyEl.textContent = chunks.join(""); });
+      } catch (se) {
+        if (chunks.length) throw se;   // 半途失败：保留已流出的文本
+        bubble.remove();
+        r = await jpost("/api/ask", { slug, question, deep: false });
+        box.insertAdjacentHTML("beforeend",
+          `<div class="chat-msg assistant answer-block"><div class="chat-src">AI 回答</div>`
+          + `<div class="line md-body">${linkifyCitations(renderMd(r.answer || ""), r.hits || [], slug)}</div>`
+          + chatHitsHtml(r.hits, slug) + `</div>`);
+      }
+      if (r && chunks.length) {
+        const answer = chunks.join("");
+        const hits = r.hits || [];
+        bodyEl.innerHTML = linkifyCitations(renderMd(answer), hits, slug);
+        if (hits.length) {
+          hitsEl.hidden = false;
+          hitsEl.innerHTML = hits.map((h) => `
+            <div class="hit">
+              <div class="src">${esc(h.chapter_title || h.path)} · ${h.lines.length} 处匹配</div>
+              ${h.lines.map((l) => `<div class="line cite-link" data-slug="${esc(slug)}"`
+                + ` data-ch="${h.chapter_no != null ? h.chapter_no : ""}" data-snip="${esc(l.snippet)}">`
+                + `${esc(l.snippet)}</div>`).join("")}
+            </div>`).join("");
+        }
+      }
+      bodyEl.removeAttribute("id");
+      hitsEl.removeAttribute("id");
+      if (r && r.session_id) {
+        chatState.sessionId = r.session_id;
+        await loadChatSessions($("#d-sessions"), slug);
+        $("#d-sessions").value = r.session_id;
+      }
     }
-    const modeTag = r.mode === "deep" ? " · 深度模式" : "";
-    const cacheTag = r.cached ? " · 秒答缓存" : "";
-    const head = r.answer
-      ? `<div class="hit answer-block"><div class="src">AI 回答${modeTag}${cacheTag} · 已记入常见问题</div>`
-        + `<div class="line md-body">${linkifyCitations(renderMd(r.answer), r.hits, slug)}</div></div>`
-      : `<div class="hit"><div class="src">暂未生成回答`
-        + `${r.answer_error ? "（" + esc(r.answer_error) + "）" : ""}，以下是相关书摘</div></div>`;
-    const body = r.hits.length
-      ? r.hits.map((h) => `
-        <div class="hit">
-          <div class="src">${esc(h.chapter_title || h.path)} · ${h.lines.length} 处匹配</div>
-          ${h.lines.map((l) => `<div class="line cite-link" data-slug="${esc(slug)}"`
-            + ` data-ch="${h.chapter_no != null ? h.chapter_no : ""}" data-snip="${esc(l.snippet)}">`
-            + `${esc(l.snippet)}</div>`).join("")}
-        </div>`).join("")
-      : '<p class="hint">没有找到相关内容</p>';
-    $("#d-hits").innerHTML = head + body;
-    toast("已记录你的提问");
+    box.scrollTop = box.scrollHeight;
     loadBookQA(slug);
   } catch (e) { fail(e); }
   finally {
     btn.textContent = "提问";
     btn.classList.remove("busy");
+    bookAskBusy = false;
   }
-});
+}
+
+$("#d-ask").addEventListener("click", askBookChat);
 $("#d-question").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#d-ask").click(); });
+$("#d-sessions").addEventListener("change", async (e) => {
+  const sid = e.target.value;
+  const box = $("#d-hits");
+  if (!sid) { chatState.sessionId = null; box.innerHTML = ""; return; }
+  try {
+    const r = await jget("/api/chat/sessions/" + encodeURIComponent(sid));
+    chatState.sessionId = sid;
+    renderChatMsgs(box, r.messages, chatState.slug);
+  } catch (err) { fail(err); }
+});
+$("#d-newchat").addEventListener("click", () => {
+  chatState.sessionId = null;
+  $("#d-hits").innerHTML = "";
+  $("#d-sessions").value = "";
+});
 
 const drop = $("#drop"), fileInput = $("#file");
 function setFile(f) {
@@ -762,44 +841,100 @@ async function loadFaq() {
       : '<p class="empty">还没有记录的提问</p>';
   } catch (e) { toast("加载失败: " + e.message); }
 }
+let libAskBusy = false;
 async function askLibrary() {
+  if (libAskBusy) return;
+  libAskBusy = true;
   const q = $("#lib-question").value.trim();
   if (!q) return toast("先输入问题");
   const deep = $("#lib-deep").checked;
   const btn = $("#lib-ask");
   btn.textContent = deep ? "深度检索中…" : "检索中…";
   btn.classList.add("busy");
-  $("#lib-result").innerHTML = '<p class="hint">正在跨书检索并综合…</p>';
+  const box = $("#lib-result");
   try {
-    const r = await jpost("/api/library/ask", { question: q, deep });
-    const nbooks = (r.books || []).length;
-    const head = r.answer
-      ? `<div class="hit answer-block"><div class="src">跨书回答 · 检索 ${nbooks} 本书 · 已记入常见问题</div>`
-        + `<div class="line md-body">${linkifyCitations(renderMd(r.answer), r.hits, "")}</div></div>`
-      : `<div class="hit"><div class="src">暂未生成回答`
-        + `${r.answer_error ? "（" + esc(r.answer_error) + "）" : ""}，以下是相关书摘</div></div>`;
-    const body = (r.hits || []).length
-      ? r.hits.map((h) => `
-        <div class="hit">
-          <div class="src">《${esc(h.book_title || h.book_slug)}》· ${esc(h.chapter_title || h.path)} · ${h.lines.length} 处匹配</div>
-          ${h.lines.map((l) => `<div class="line cite-link" data-slug="${esc(h.book_slug || "")}"`
-            + ` data-ch="${h.chapter_no != null ? h.chapter_no : ""}" data-snip="${esc(l.snippet)}">`
-            + `${esc(l.snippet)}</div>`).join("")}
-        </div>`).join("")
-      : '<p class="hint">没有找到相关内容</p>';
-    $("#lib-result").innerHTML = head + body;
+    box.insertAdjacentHTML("beforeend",
+      `<div class="chat-msg user"><div class="chat-text">${esc(q)}</div></div>`);
+    if (deep) {
+      const r = await jpost("/api/library/ask", { question: q, deep });
+      box.insertAdjacentHTML("beforeend",
+        `<div class="chat-msg assistant answer-block"><div class="chat-src">跨书回答 · 深度模式</div>`
+        + `<div class="line md-body">${linkifyCitations(renderMd(r.answer || ""), r.hits || [], "")}</div>`
+        + chatHitsHtml(r.hits, "") + `</div>`);
+    } else {
+      box.insertAdjacentHTML("beforeend",
+        `<div class="chat-msg assistant answer-block">`
+        + `<div class="chat-src">跨书回答 · 流式</div>`
+        + `<div class="line md-body" id="stream-body"></div>`
+        + `<div class="chat-hits" id="stream-hits" hidden></div></div>`);
+      const bubble = box.lastElementChild;
+      const bodyEl = bubble.querySelector("#stream-body");
+      const hitsEl = bubble.querySelector("#stream-hits");
+      const chunks = [];
+      let r = null;
+      try {
+        r = await streamChat({ slug: "", question: q, session_id: libChatState.sessionId || "" },
+          (tok) => { chunks.push(tok); bodyEl.textContent = chunks.join(""); });
+      } catch (se) {
+        if (chunks.length) throw se;
+        bubble.remove();
+        r = await jpost("/api/library/ask", { question: q, deep: false });
+        box.insertAdjacentHTML("beforeend",
+          `<div class="chat-msg assistant answer-block"><div class="chat-src">跨书回答</div>`
+          + `<div class="line md-body">${linkifyCitations(renderMd(r.answer || ""), r.hits || [], "")}</div>`
+          + chatHitsHtml(r.hits, "") + `</div>`);
+      }
+      if (r && chunks.length) {
+        const answer = chunks.join("");
+        const hits = r.hits || [];
+        bodyEl.innerHTML = linkifyCitations(renderMd(answer), hits, "");
+        if (hits.length) {
+          hitsEl.hidden = false;
+          hitsEl.innerHTML = hits.map((h) => `
+            <div class="hit">
+              <div class="src">《${esc(h.book_title || h.book_slug)}》· ${esc(h.chapter_title || h.path)} · ${h.lines.length} 处匹配</div>
+              ${h.lines.map((l) => `<div class="line cite-link" data-slug="${esc(h.book_slug || "")}"`
+                + ` data-ch="${h.chapter_no != null ? h.chapter_no : ""}" data-snip="${esc(l.snippet)}">`
+                + `${esc(l.snippet)}</div>`).join("")}
+            </div>`).join("");
+        }
+      }
+      bodyEl.removeAttribute("id");
+      hitsEl.removeAttribute("id");
+      if (r && r.session_id) {
+        libChatState.sessionId = r.session_id;
+        await loadChatSessions($("#lib-sessions"), "");
+        $("#lib-sessions").value = r.session_id;
+      }
+    }
+    box.scrollTop = box.scrollHeight;
     loadFaq();
   } catch (e) {
-    $("#lib-result").innerHTML = "";
     fail(e);
   } finally {
     btn.textContent = "问书库";
     btn.classList.remove("busy");
+    libAskBusy = false;
   }
 }
 $("#lib-ask").addEventListener("click", askLibrary);
 $("#lib-question").addEventListener("keydown", (e) => {
   if (e.key === "Enter") askLibrary();
+});
+$("#lib-sessions").addEventListener("change", async (e) => {
+  const sid = e.target.value;
+  const box = $("#lib-result");
+  if (!sid) { libChatState.sessionId = null; box.innerHTML = ""; return; }
+  try {
+    const r = await jget("/api/chat/sessions/" + encodeURIComponent(sid));
+    libChatState.sessionId = sid;
+    renderChatMsgs(box, r.messages, "");
+  } catch (err) { fail(err); }
+});
+$("#lib-newchat").addEventListener("click", () => {
+  libChatState.sessionId = null;
+  $("#lib-result").innerHTML = "";
+  $("#lib-sessions").value = "";
 });
 $("#faq-scope").addEventListener("change", loadFaq);$("#faq-list").addEventListener("click", async (e) => {
   const gen = e.target.closest("button[data-gen]");

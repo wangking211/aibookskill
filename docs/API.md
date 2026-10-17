@@ -144,6 +144,46 @@ multipart 上传 PDF。字段：
 
 **注意**：提问会自动写入 `interactions`，并进入 FAQ 聚类池。
 
+### POST /api/chat — 会话式多轮问答（SSE）
+```json
+{"question": "MCP 是什么？", "slug": "ai-agents-with-mcp", "session_id": ""}
+```
+
+- `slug=""` 表示跨书会话；非空表示单书会话
+- `session_id=""` 或省略：自动创建新会话（标题=首问前 40 字）
+- 传已有 `session_id`：追加到该会话（自动校验归属，跨用户 404）
+- 上下文=最近 12 条消息（每条截 1500 字符）+ 本次实时检索 hits
+- **不写 `answer_cache`**（上下文相关，缓存会污染追问）；`interactions` 记 `tool="chat"`（不进 FAQ 聚类池）
+
+SSE 事件（`data: {json}\n\n`）：
+```
+{"type": "token", "text": "增"}
+{"type": "done", "hits": [...], "model": "gpt-...", "session_id": "abc123..."}
+{"type": "error", "error": "..."}
+```
+
+### GET /api/chat/sessions — 会话列表
+`?slug=<book_slug>` 过滤单书会话；`?slug=`（空串）仅跨书会话；省略参数返回全部。
+```json
+[{"id": "abc...", "slug": "ai-agents-with-mcp", "title": "MCP 是什么？",
+  "created_at": 1791..., "updated_at": 1791...}]
+```
+
+### GET /api/chat/sessions/{session_id} — 会话回放
+```json
+{"session": {...}, "messages": [
+  {"id": 1, "role": "user", "content": "...", "hits": [], "created_at": ...},
+  {"id": 2, "role": "assistant", "content": "...【引用:...】",
+   "hits": [{"path": "...", "chapter_no": 3, "chapter_title": "...", "lines": [...]}],
+   "created_at": ...}]}
+```
+
+### DELETE /api/chat/sessions/{session_id} — 删除会话（连带消息）
+
+### POST /api/ask/stream — 单书流式问答（SSE，旧接口保留）
+请求体同 `/api/ask`（`deep` 忽略，仅 fast）。事件：`token` / `done`（含 `cached`）/ `error`。
+前端会话式 UI 已迁移到 `/api/chat`；本接口供兼容与 TTFB 探测。
+
 ---
 
 ## 6. FAQ

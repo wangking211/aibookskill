@@ -105,7 +105,11 @@
       </label>
       <button id="lib-ask" class="primary">问书库</button>
     </div>
-    <div id="lib-result"></div>
+    <div class="chat-bar">
+      <select id="lib-sessions" title="历史会话"><option value="">当前对话</option></select>
+      <button id="lib-newchat" class="ghost">新对话</button>
+    </div>
+    <div id="lib-result" class="chat-conv"></div>
     <p class="hint">客户端安装包（aibook MCP + book-to-skill + 本地转换栈 + Windows/macOS 安装脚本）：
       <a href="/static/aibook-kit.zip" download>下载 aibook-kit.zip</a>，
       解压后运行 <code>install.ps1</code> 或 <code>bash install.sh</code>。</p>
@@ -189,13 +193,17 @@
     </div>
     <p id="d-intro"></p>
     <div class="ask">
-      <input id="d-question" placeholder="对这本书提问，记录你的问题以形成常见问题…">
+      <input id="d-question" placeholder="对这本书提问，可连续追问…">
       <label class="deep-toggle" title="多步检索并阅读章节，回答更深入，耗时更长">
         <input type="checkbox" id="d-deep"> 深度模式
       </label>
       <button id="d-ask" class="primary">提问</button>
     </div>
-    <div id="d-hits"></div>
+    <div class="chat-bar">
+      <select id="d-sessions" title="历史会话"><option value="">当前对话</option></select>
+      <button id="d-newchat" class="ghost">新对话</button>
+    </div>
+    <div id="d-hits" class="chat-conv"></div>
     <div class="qa-cols">
       <div class="qa-col">
         <div class="qa-title">常见问题 <span class="muted">已收录答案</span></div>

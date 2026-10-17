@@ -914,6 +914,147 @@ async def api_ask_stream(request: Request, body: AskBody):
     return StreamingResponse(gen_stream(), media_type="text/event-stream")
 
 
+class ChatBody(BaseModel):
+    question: str
+    slug: str = ""            # 空串 = 跨书
+    session_id: str = ""
+
+
+def _chat_enrich_single(slug, hits):
+    c = con()
+    chapters = {r["path"]: dict(r) for r in c.execute(
+        "SELECT no,title,path FROM chapters WHERE book_slug=?", (slug,))}
+    skill_root = (SKILLS_HOME / slug).as_posix()
+    for h in hits:
+        ch = chapters.get(h["path"]) or chapters.get(f"{skill_root}/{h['path']}")
+        h["chapter_no"] = ch["no"] if ch else None
+        h["chapter_title"] = ch["title"] if ch else h["path"]
+    return hits
+
+
+def _chat_enrich_sync(slug, question):
+    hits = _hits_for(slug, SKILLS_HOME / slug, question, 6, 3)
+    return _chat_enrich_single(slug, hits)
+
+
+def _chat_hits_library(user, question):
+    c = con()
+    books = _visible_books(c, user)
+    by_slug = {b["slug"]: b for b in books}
+    slugs = list(by_slug)
+    if not slugs:
+        return [], []
+    hits = _library_hits(slugs, question, 10, 3, 2)
+    titles = _chapter_titles(c, slugs)
+    for h in hits:
+        b = by_slug.get(h.get("book_slug")) or {}
+        h["book_title"] = b.get("title") or h.get("book_slug") or ""
+        meta = titles.get((h.get("book_slug"), Path(h.get("path") or "").name))
+        h["chapter_no"] = meta["no"] if meta else None
+        h["chapter_title"] = meta["title"] if meta else Path(h.get("path") or "").stem
+    return hits, [b["slug"] for b in books]
+
+
+@app.post("/api/chat")
+async def api_chat(request: Request, body: ChatBody):
+    """会话式多轮问答（SSE）。slug 空串=跨书。不写 answer_cache（上下文相关）。"""
+    user = require_user(request)
+    q = (body.question or "").strip()
+    if not q:
+        return JSONResponse({"error": "question required"}, status_code=400)
+    c = con()
+    slug = (body.slug or "").strip()
+    sid = (body.session_id or "").strip()
+    sess = registry.get_chat_session(c, sid, user["id"]) if sid else None
+    if sid and not sess:
+        return JSONResponse({"error": "session not found"}, status_code=404)
+    if sess:
+        slug = sess["slug"] or ""
+    if not sess:
+        sid = registry.create_chat_session(
+            c, user["space_id"], user["id"], slug, title=q[:40])
+    history = registry.get_chat_messages(c, sid, limit=12)
+
+    if slug:
+        b = registry.find_book(c, slug)
+        if not b:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        hits = await asyncio.to_thread(_chat_enrich_sync, slug, q)
+        title = b["title"] or ""
+    else:
+        hits, _slugs = await asyncio.to_thread(_chat_hits_library, user, q)
+        title = ""
+
+    msgs = llm.build_chat_messages(q, hits, title, history)
+
+    def sse(obj):
+        return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+    # 先落库 user 消息（流失败也保留追问现场）
+    def _append(sid_, role_, content_, hits_=None):
+        registry.append_chat_message(con(), sid_, role_, content_, hits_)
+
+    await asyncio.to_thread(_append, sid, "user", q)
+
+    t0 = time.time()
+    chunks = []
+    model_used = None
+    usage = {}
+
+    async def gen():
+        nonlocal model_used
+        stream, model, err = await llm.chat_async_stream(
+            CFG, None, None, 90, usage_out=usage, messages=msgs)
+        if err or stream is None:
+            yield sse({"type": "error", "error": err or "stream unavailable"})
+            return
+        model_used = model
+        try:
+            async for tok in stream:
+                chunks.append(tok)
+                yield sse({"type": "token", "text": tok})
+        except Exception as e:
+            yield sse({"type": "error", "error": f"stream interrupted: {e}"})
+            return
+        answer = "".join(chunks)
+        latency_ms = int((time.time() - t0) * 1000)
+        await asyncio.to_thread(_append, sid, "assistant", answer, hits)
+        registry.log_interaction(c, user["space_id"], user["display_name"], slug,
+                                 "web", "chat", q, len(hits), answer=answer,
+                                 model=model_used, latency_ms=latency_ms,
+                                 tokens_in=usage.get("tokens_in"),
+                                 tokens_out=usage.get("tokens_out"))
+        yield sse({"type": "done", "hits": hits, "model": model_used,
+                   "session_id": sid})
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.get("/api/chat/sessions")
+def api_chat_sessions(request: Request, slug: str = None):
+    """会话列表。省略 slug=全部；slug=''=仅跨书会话。"""
+    user = require_user(request)
+    return registry.list_chat_sessions(con(), user["id"],
+                                       slug if slug is not None else None)
+
+
+@app.get("/api/chat/sessions/{sid}")
+def api_chat_session_get(request: Request, sid: str):
+    user = require_user(request)
+    sess = registry.get_chat_session(con(), sid, user["id"])
+    if not sess:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return {"session": sess,
+            "messages": registry.get_chat_messages(con(), sid, limit=50)}
+
+
+@app.delete("/api/chat/sessions/{sid}")
+def api_chat_session_delete(request: Request, sid: str):
+    user = require_user(request)
+    registry.delete_chat_session(con(), sid, user["id"])
+    return {"ok": True}
+
+
 class LibraryAskBody(BaseModel):
     question: str
     deep: bool = False
