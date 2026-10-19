@@ -70,6 +70,9 @@ multipart 上传 PDF。字段：
 
 同 sha256 已存在则秒传。返回 `{job_id, slug, deduped: bool}`。
 
+**批量**：无专用批量端点。前端多选/整夹上传时并发 3 循环调用本端点（每文件独立
+去重与入队）；服务器/本地 CLI 批量入队用 `python pipeline/worker.py --enqueue-dir DIR`。
+
 ### POST /api/upload/presign + /api/upload/complete
 大文件分片上传两步走：先换 COS 预签名 URL，传完后确认入库。
 

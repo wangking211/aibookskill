@@ -1037,6 +1037,10 @@ def main():
                     help="本地转换成功后把 skill 成品+PDF 推送到服务器")
     ap.add_argument("--translate", metavar="SLUG",
                     help="本地翻译指定 slug 的章节并回传服务端")
+    ap.add_argument("--enqueue-dir", metavar="DIR",
+                    help="批量入队：扫描目录下所有 PDF，逐个注册 convert 任务（不立即处理）")
+    ap.add_argument("--enqueue-space", default="local",
+                    help="批量入队任务的 space_id（默认 local）")
     a = ap.parse_args()
 
     cfg = load_config()
@@ -1047,6 +1051,49 @@ def main():
         for r in con.execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT 30"):
             print(f"{r['id']:<14} {r['state']:<9} {str(r['slug'] or ''):<24} "
                   f"{r['elapsed_sec'] or 0:>6} {r['token_actual'] or 0:>8} {r['detail'] or ''}")
+        return
+
+    if a.enqueue_dir:
+        d = Path(a.enqueue_dir)
+        if not d.is_dir():
+            sys.exit(f"not a directory: {d}")
+        pdfs = sorted(p for p in d.rglob("*.pdf") if p.is_file())
+        if not pdfs:
+            print(f"no pdf in {d}")
+            return
+        print(f"scanning {len(pdfs)} pdf in {d}")
+        inbox = path_in(cfg, "inbox")
+        inbox.mkdir(parents=True, exist_ok=True)
+        queued = dups = errs = 0
+        for p in pdfs:
+            try:
+                sha = registry.sha256_file(p)
+                hit = registry.find_books_by_sha(con, sha)
+                if hit:
+                    print(f"  dup     {p.name} -> {hit[0]['slug']}")
+                    dups += 1
+                    continue
+                slug = slugify(p.name, sha)
+                base = slug
+                n = 2
+                while registry.find_book(con, slug):
+                    slug = f"{base}-{n}"
+                    n += 1
+                dest = inbox / p.name
+                i = 1
+                while dest.exists():
+                    dest = inbox / f"{p.stem}-{i}.pdf"
+                    i += 1
+                shutil.copy2(p, dest)
+                jid = enqueue(cfg, con, dest, slug, kind="convert",
+                              space=a.enqueue_space)
+                print(f"  queue   {jid} {slug} <- {p.name}")
+                queued += 1
+            except Exception as e:
+                print(f"  err     {p.name}: {e}")
+                errs += 1
+        print(f"done: queued={queued} dup={dups} err={errs}")
+        print("run worker --daemon (or --once) to process; multiple workers = parallel")
         return
 
     if a.job:

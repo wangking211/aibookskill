@@ -124,7 +124,33 @@ print(con.execute('SELECT COUNT(*) FROM embeds').fetchone()[0])"
 
 ---
 
-## 6. 部署检查清单
+## 6. 批量上传与并行处理
+
+### 网页批量上传
+上传页支持**多选文件**或**选择文件夹**（webkitdirectory），一次拖拽/选择多个 PDF，
+前端以并发 3 逐个调用 `/api/upload`（复用单文件端点，含 sha256 秒传去重）。
+进度显示在按钮上（`上传 N/M x%`），完成后自动跳到「处理任务」页。
+
+### CLI 批量入队（服务器/本地通用）
+```bash
+# 扫描目录下所有 PDF（递归），逐个注册 convert 任务，不立即处理
+python pipeline/worker.py --enqueue-dir /path/to/books
+# 指定 space（默认 local）
+python pipeline/worker.py --enqueue-dir /path/to/books --enqueue-space u433583281b64
+
+# 入队后启动（或已在跑的）worker 消化队列
+python pipeline/worker.py --daemon    # 常驻
+python pipeline/worker.py --once      # 处理完退出
+```
+
+- **去重**：入队前按 sha256 查 `find_books_by_sha`，已发布同书直接跳过
+- **文件位置**：PDF 复制进 `inbox/`，由 `aibook-sync.timer`（m1→m2）60s 内同步到对端
+- **并行**：每台机器一个 `aibook-worker` 进程 = 2 路并行（m1+m2）；同机多开 `--daemon` 可再加路数
+- **认领**：`claim_next_job` 乐观锁 + 同 slug 串行，多 worker 安全
+
+---
+
+## 7. 部署检查清单
 
 改代码/配置后必查：
 
@@ -149,7 +175,7 @@ curl -s -o /dev/null -w "%{http_code}" https://mindos.zxixing.com/health
 
 ---
 
-## 7. 同步与一致性
+## 8. 同步与一致性
 
 - **代码**：m1/m2 需手动保持一致（rsync 不覆盖 `/opt/aibook/app` 代码，只同步内容目录）
 - **内容**：`aibook-sync.timer` 每 60s rsync `skills/ covers/ sources/ inbox/ library/` m1→m2
@@ -159,7 +185,7 @@ curl -s -o /dev/null -w "%{http_code}" https://mindos.zxixing.com/health
 
 ---
 
-## 8. 监控与告警（待建）
+## 9. 监控与告警（待建）
 
 当前无自动告警。人工巡检项：
 - 四端点 200 + mindos 200

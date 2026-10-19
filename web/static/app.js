@@ -3,7 +3,7 @@ const $$ = (s) => [...document.querySelectorAll(s)];
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
   (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
-let uploadFile = null;
+let uploadFiles = [];
 let jobsTimer = null;
 
 async function jget(url) {
@@ -689,21 +689,26 @@ $("#d-newchat").addEventListener("click", () => {
   $("#d-sessions").value = "";
 });
 
-const drop = $("#drop"), fileInput = $("#file");
-function setFile(f) {
-  if (!f) return;
-  uploadFile = f;
-  $("#up-name").textContent = `已选择: ${f.name} (${(f.size / 1048576).toFixed(1)} MB)`;
+const drop = $("#drop"), fileInput = $("#file"), folderInput = $("#folder");
+function setFiles(list) {
+  const pdfs = [...list].filter((f) => /\.pdf$/i.test(f.name));
+  const skipped = list.length - pdfs.length;
+  if (!pdfs.length) { toast("没有选中 PDF 文件"); return; }
+  uploadFiles = pdfs;
+  const totalMB = (pdfs.reduce((s, f) => s + f.size, 0) / 1048576).toFixed(1);
+  $("#up-name").textContent = `已选择 ${pdfs.length} 个 PDF（共 ${totalMB} MB）`
+    + (skipped ? `，跳过 ${skipped} 个非 PDF` : "");
 }
 drop.addEventListener("click", (e) => { if (e.target === drop) fileInput.click(); });
-fileInput.addEventListener("change", () => setFile(fileInput.files[0]));
+fileInput.addEventListener("change", () => setFiles(fileInput.files));
+folderInput.addEventListener("change", () => setFiles(folderInput.files));
 ["dragover", "dragenter"].forEach((ev) => drop.addEventListener(ev, (e) => {
   e.preventDefault(); drop.classList.add("over");
 }));
 ["dragleave", "drop"].forEach((ev) => drop.addEventListener(ev, (e) => {
   e.preventDefault(); drop.classList.remove("over");
 }));
-drop.addEventListener("drop", (e) => setFile(e.dataTransfer.files[0]));
+drop.addEventListener("drop", (e) => setFiles(e.dataTransfer.files));
 function xhrPut(url, file, onPct) {
   return new Promise((resolve, reject) => {
     const x = new XMLHttpRequest();
@@ -725,11 +730,55 @@ async function sha256Hex(file) {
     .map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+async function uploadOne(file, meta, onPct) {
+  const pres = await fetch("/api/upload/presign", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ filename: file.name, size: file.size }),
+  }).then((r) => r.json());
+  if (pres && pres.mode === "cos") {
+    const shaP = sha256Hex(file);
+    await xhrPut(pres.put_url, file, onPct);
+    const rr = await fetch("/api/upload/complete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key: pres.key, filename: file.name, sha256: await shaP, ...meta }),
+    });
+    if (!rr.ok) throw new Error((await rr.json().catch(() => ({}))).error || rr.status);
+    return await rr.json();
+  }
+  const fd = new FormData();
+  fd.append("file", file);
+  fd.append("slug", meta.slug);
+  fd.append("book_type", meta.book_type);
+  fd.append("depth", meta.depth);
+  fd.append("translate_zh", meta.translate_zh ? "1" : "");
+  fd.append("lang_mode", meta.lang_mode || "");
+  fd.append("model", meta.model || "");
+  const r = await fetch("/api/upload", { method: "POST", body: fd });
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.status);
+  return await r.json();
+}
+
+async function mapPool(items, limit, fn) {
+  const ret = [];
+  let i = 0;
+  const runner = async () => {
+    while (i < items.length) {
+      const idx = i++;
+      ret[idx] = await fn(items[idx], idx);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, runner));
+  return ret;
+}
+
 $("#up-go").addEventListener("click", async (e) => {
   e.preventDefault();
-  if (!uploadFile) return toast("先选择 PDF");
+  if (!uploadFiles.length) return toast("先选择 PDF");
+  const single = uploadFiles.length === 1;
   const meta = {
-    slug: $("#up-slug").value.trim(),
+    slug: single ? $("#up-slug").value.trim() : "",
     book_type: $("#up-type").value,
     depth: $("#up-depth").value,
     translate_zh: $("#up-lang").value !== "",
@@ -737,53 +786,37 @@ $("#up-go").addEventListener("click", async (e) => {
     model: $("#up-model").value,
   };
   const btn = e.target;
+  btn.disabled = true;
+  let done = 0;
+  const total = uploadFiles.length;
+  const res = { queued: 0, dup: 0, failed: 0 };
+  const errs = [];
   try {
-    let out;
-    const pres = await fetch("/api/upload/presign", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ filename: uploadFile.name, size: uploadFile.size }),
-    }).then((r) => r.json());
-    if (pres && pres.mode === "cos") {
-      const shaP = sha256Hex(uploadFile);
-      await xhrPut(pres.put_url, uploadFile,
-        (pct) => { btn.textContent = `上传中 ${pct}%`; });
-      const rr = await fetch("/api/upload/complete", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          key: pres.key, filename: uploadFile.name,
-          sha256: await shaP, ...meta,
-        }),
-      });
-      if (!rr.ok) throw new Error((await rr.json().catch(() => ({}))).error || rr.status);
-      out = await rr.json();
-    } else {
-      const fd = new FormData();
-      fd.append("file", uploadFile);
-      fd.append("slug", meta.slug);
-      fd.append("book_type", meta.book_type);
-      fd.append("depth", meta.depth);
-      fd.append("translate_zh", meta.translate_zh ? "1" : "");
-      fd.append("lang_mode", meta.lang_mode || "");
-      fd.append("model", meta.model || "");
-      const r = await fetch("/api/upload", { method: "POST", body: fd });
-      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.status);
-      out = await r.json();
-    }
-    if (out.duplicate) {
-      toast(`检测到相同书籍《${out.title || out.slug}》，已秒传复用`);
-      uploadFile = null; fileInput.value = "";
-      $("#up-name").textContent = ""; $("#up-slug").value = "";
-      switchTab("library");
-      return;
-    }
-    toast(`已上传，任务 ${out.job_id} 已排队`);
-    uploadFile = null; fileInput.value = "";
-    $("#up-name").textContent = ""; $("#up-slug").value = "";
-    switchTab("jobs");
+    await mapPool(uploadFiles, 3, async (f, idx) => {
+      try {
+        const out = await uploadOne(f, meta, (pct) => {
+          btn.textContent = `上传 ${idx + 1}/${total} ${pct}%`;
+        });
+        if (out.duplicate) res.dup++; else res.queued++;
+      } catch (err) {
+        res.failed++; errs.push(`${f.name}: ${err.message || err}`);
+      } finally {
+        done++;
+        btn.textContent = `进度 ${done}/${total}`;
+      }
+    });
+    const parts = [];
+    if (res.queued) parts.push(`${res.queued} 本已入队`);
+    if (res.dup) parts.push(`${res.dup} 本秒传复用`);
+    if (res.failed) parts.push(`${res.failed} 本失败`);
+    toast(parts.join("，") || "无结果");
+    if (errs.length) console.warn("上传失败:", errs);
+    uploadFiles = []; fileInput.value = ""; folderInput.value = "";
+    $("#up-name").textContent = errs.length ? "失败: " + errs.join("; ") : "";
+    $("#up-slug").value = "";
+    if (res.queued) switchTab("jobs");
   } catch (err) { fail(err); }
-  finally { btn.textContent = "上传并开始转换"; }
+  finally { btn.disabled = false; btn.textContent = "上传并开始转换"; }
 });
 
 async function loadJobs() {

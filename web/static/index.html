@@ -40,8 +40,10 @@
   <section id="tab-upload" class="tab">
     <div class="card panel">
       <h2>上传书籍（转换后进入公共书库）</h2>
-      <div id="drop" class="drop">拖拽 PDF 到此处，或 <label for="file">选择文件</label>
-        <input id="file" type="file" accept="application/pdf" hidden>
+      <div id="drop" class="drop">拖拽 PDF 到此处，或 <label for="file">选择文件</label>（可多选）
+        <input id="file" type="file" accept="application/pdf" multiple hidden>
+        或 <label for="folder">选择文件夹</label>
+        <input id="folder" type="file" webkitdirectory directory multiple hidden>
       </div>
       <form id="up-form">
         <div class="row">
